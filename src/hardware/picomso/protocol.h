@@ -84,10 +84,30 @@ enum picomso_status_code {
     PICOMSO_STATUS_ERR_VERSION   = 0x05,
 };
 
-enum picomso_device_mode {
-    PICOMSO_MODE_UNSET        = 0x00,
-    PICOMSO_MODE_LOGIC        = 0x01,
-    PICOMSO_MODE_OSCILLOSCOPE = 0x02,
+/*
+ * Stream selection mask used by the control plane.
+ *
+ * 0x00: no streams enabled
+ * 0x01: logic stream enabled
+ * 0x02: scope stream enabled
+ * 0x03: logic + scope enabled (mixed)
+ */
+enum picomso_stream_mask {
+    PICOMSO_STREAM_NONE  = 0x00,
+    PICOMSO_STREAM_LOGIC = 1u << 0,
+    PICOMSO_STREAM_SCOPE = 1u << 1,
+};
+
+/*
+ * Concrete stream identity for a single DATA_BLOCK packet.
+ *
+ * A transmitted block belongs to exactly one stream, even when the
+ * device is configured with multiple enabled streams.
+ */
+enum picomso_stream_id {
+    PICOMSO_STREAM_ID_NONE  = 0x00,
+    PICOMSO_STREAM_ID_LOGIC = 0x01,
+    PICOMSO_STREAM_ID_SCOPE = 0x02,
 };
 
 enum picomso_capture_state {
@@ -140,14 +160,16 @@ struct picomso_info {
 };
 
 struct picomso_status {
-    uint8_t mode;
+    uint8_t streams;
     uint8_t capture_state;
 };
 
 struct picomso_data_block {
+    uint8_t  stream_id;
+    uint8_t  flags;
     uint16_t block_id;
     uint16_t data_len;
-    uint8_t data[PICOMSO_DATA_BLOCK_SIZE];
+    uint8_t  data[PICOMSO_DATA_BLOCK_SIZE];
 };
 
 struct dev_context {
@@ -171,9 +193,12 @@ struct dev_context {
 
     gboolean acq_aborted;
     enum picomso_acq_state acq_state;
-    enum picomso_device_mode capture_mode;
 
-    uint16_t expected_block_id;
+    uint8_t enabled_streams;
+
+    uint16_t expected_logic_block_id;
+    uint16_t expected_scope_block_id;
+
     gint64 capture_deadline_us;
 
     GSList *enabled_analog_channels;
