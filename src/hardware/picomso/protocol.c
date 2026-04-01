@@ -395,6 +395,58 @@ static int trigger_match_to_picomso(enum sr_trigger_matches match,
     return SR_OK;
 }
 
+static int configure_capture_mode(const struct sr_dev_inst *sdi,
+    enum picomso_device_mode *mode)
+{
+    struct dev_context *devc;
+    const GSList *l;
+    struct sr_channel *ch;
+    unsigned int enabled_logic;
+    unsigned int enabled_analog;
+
+    devc = sdi->priv;
+
+    g_slist_free(devc->enabled_analog_channels);
+    devc->enabled_analog_channels = NULL;
+
+    enabled_logic = 0;
+    enabled_analog = 0;
+
+    for (l = sdi->channels; l; l = l->next) {
+        ch = l->data;
+
+        if (!ch->enabled)
+            continue;
+
+        if (ch->type == SR_CHANNEL_ANALOG) {
+            enabled_analog++;
+            devc->enabled_analog_channels =
+                g_slist_append(devc->enabled_analog_channels, ch);
+        } else if (ch->type == SR_CHANNEL_LOGIC) {
+            enabled_logic++;
+        }
+    }
+
+    /*
+     * Keep the first scope-capable backend simple:
+     * - logic only -> logic mode
+     * - analog only -> scope mode
+     * - mixed logic+analog at the same time -> not supported yet
+     */
+    if (enabled_logic > 0 && enabled_analog > 0) {
+        sr_err("Simultaneous logic and oscilloscope capture is not supported yet.");
+        return SR_ERR_NA;
+    }
+
+    if (enabled_analog > 0) {
+        *mode = PICOMSO_MODE_OSCILLOSCOPE;
+        return SR_OK;
+    }
+
+    *mode = PICOMSO_MODE_LOGIC;
+    return SR_OK;
+}
+
 static int build_capture_request(const struct sr_dev_inst *sdi,
     struct picomso_request_capture *request)
 {
@@ -446,6 +498,8 @@ static int build_capture_request(const struct sr_dev_inst *sdi,
         match = l->data;
 
         if (!match->match || !match->channel || !match->channel->enabled)
+            continue;
+        if (match->channel->type != SR_CHANNEL_LOGIC)
             continue;
         if (match->channel->index >= NUM_CHANNELS)
             return SR_ERR_ARG;
@@ -500,6 +554,61 @@ static int send_logic_data(struct sr_dev_inst *sdi,
     return sr_session_send(sdi, &packet);
 }
 
+static int send_scope_analog_data(struct sr_dev_inst *sdi,
+    const struct picomso_data_block *block)
+{
+    struct dev_context *devc;
+    struct sr_datafeed_packet packet;
+    struct sr_datafeed_analog analog;
+    struct sr_analog_encoding encoding;
+    struct sr_analog_meaning meaning;
+    struct sr_analog_spec spec;
+    float samples[PICOMSO_DATA_BLOCK_SIZE / 2];
+    size_t sample_count;
+    size_t i;
+    uint16_t raw;
+
+    devc = sdi->priv;
+
+    if ((block->data_len % 2u) != 0u)
+        return SR_ERR;
+
+    sample_count = block->data_len / 2u;
+
+    if (devc->limit_samples &&
+        devc->sent_samples + sample_count > devc->limit_samples) {
+        sample_count = (size_t)(devc->limit_samples - devc->sent_samples);
+    }
+
+    if (sample_count == 0u)
+        return SR_OK;
+
+    for (i = 0; i < sample_count; i++) {
+        raw = (uint16_t)block->data[2u * i]
+            | ((uint16_t)block->data[2u * i + 1u] << 8);
+
+        /* If firmware stores 12-bit ADC values in 16-bit words. */
+        raw &= 0x0FFFu;
+
+        samples[i] = (3.3f * (float)raw) / 4095.0f;
+    }
+
+    sr_analog_init(&analog, &encoding, &meaning, &spec, 2);
+    analog.meaning->channels = devc->enabled_analog_channels;
+    analog.meaning->mq = SR_MQ_VOLTAGE;
+    analog.meaning->unit = SR_UNIT_VOLT;
+    analog.meaning->mqflags = 0;
+    analog.num_samples = sample_count;
+    analog.data = samples;
+
+    packet.type = SR_DF_ANALOG;
+    packet.payload = &analog;
+
+    devc->sent_samples += sample_count;
+
+    return sr_session_send(sdi, &packet);
+}
+
 static void finish_acquisition(struct sr_dev_inst *sdi)
 {
     struct dev_context *devc;
@@ -516,8 +625,12 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
 
     devc->acq_aborted = FALSE;
     devc->acq_state = PICOMSO_ACQ_IDLE;
+    devc->capture_mode = PICOMSO_MODE_UNSET;
     devc->expected_block_id = 0;
     devc->capture_deadline_us = 0;
+
+    g_slist_free(devc->enabled_analog_channels);
+    devc->enabled_analog_channels = NULL;
 }
 
 static int receive_data(int fd, int revents, void *cb_data)
@@ -547,8 +660,8 @@ static int receive_data(int fd, int revents, void *cb_data)
             return FALSE;
         }
 
-        if (status.mode != PICOMSO_MODE_LOGIC) {
-            sr_err("Device left logic mode while capture was running.");
+        if (status.mode != devc->capture_mode) {
+            sr_err("Device left expected capture mode while acquisition was running.");
             finish_acquisition(sdi);
             return FALSE;
         }
@@ -590,12 +703,20 @@ static int receive_data(int fd, int revents, void *cb_data)
             finish_acquisition(sdi);
             return FALSE;
         }
-        ret = send_logic_data(sdi, &block);
+
+        if (devc->capture_mode == PICOMSO_MODE_LOGIC)
+            ret = send_logic_data(sdi, &block);
+        else if (devc->capture_mode == PICOMSO_MODE_OSCILLOSCOPE)
+            ret = send_scope_analog_data(sdi, &block);
+        else
+            ret = SR_ERR;
+
         if (ret != SR_OK) {
-            sr_err("Failed to forward PicoMSO logic data.");
+            sr_err("Failed to forward PicoMSO capture data.");
             finish_acquisition(sdi);
             return FALSE;
         }
+
         devc->expected_block_id++;
     }
 
@@ -687,8 +808,8 @@ SR_PRIV int picomso_dev_open(struct sr_dev_inst *sdi, struct sr_dev_driver *di)
             break;
         }
 
-        if ((devc->capabilities & PICOMSO_CAP_LOGIC) == 0u) {
-            sr_err("Connected PicoMSO device does not expose logic capability.");
+        if ((devc->capabilities & (PICOMSO_CAP_LOGIC | PICOMSO_CAP_SCOPE)) == 0u) {
+            sr_err("Connected PicoMSO device exposes neither logic nor scope capability.");
             libusb_release_interface(usb->devhdl, USB_INTERFACE);
             libusb_close(usb->devhdl);
             usb->devhdl = NULL;
@@ -724,8 +845,10 @@ SR_PRIV struct dev_context *picomso_dev_new(void)
     devc->next_seq = 1u;
     devc->last_device_status = PICOMSO_STATUS_OK;
     devc->acq_state = PICOMSO_ACQ_IDLE;
+    devc->capture_mode = PICOMSO_MODE_UNSET;
     devc->expected_block_id = 0;
     devc->capture_deadline_us = 0;
+    devc->enabled_analog_channels = NULL;
     clear_error_state(devc);
 
     return devc;
@@ -741,6 +864,7 @@ SR_PRIV int picomso_start_acquisition(const struct sr_dev_inst *sdi)
     struct dev_context *devc;
     struct picomso_request_capture request;
     struct picomso_status status;
+    enum picomso_device_mode mode;
     gint64 capture_time_us;
     int ret;
 
@@ -749,11 +873,27 @@ SR_PRIV int picomso_start_acquisition(const struct sr_dev_inst *sdi)
     if (devc->acq_state != PICOMSO_ACQ_IDLE)
         return SR_ERR;
 
+    ret = configure_capture_mode(sdi, &mode);
+    if (ret != SR_OK)
+        return ret;
+
+    if (mode == PICOMSO_MODE_OSCILLOSCOPE &&
+        (devc->capabilities & PICOMSO_CAP_SCOPE) == 0u) {
+        sr_err("This PicoMSO firmware does not expose oscilloscope capability.");
+        return SR_ERR_NA;
+    }
+
+    if (mode == PICOMSO_MODE_LOGIC &&
+        (devc->capabilities & PICOMSO_CAP_LOGIC) == 0u) {
+        sr_err("This PicoMSO firmware does not expose logic capability.");
+        return SR_ERR_NA;
+    }
+
     ret = build_capture_request(sdi, &request);
     if (ret != SR_OK)
         return ret;
 
-    ret = command_set_mode(sdi, PICOMSO_MODE_LOGIC);
+    ret = command_set_mode(sdi, mode);
     if (ret != SR_OK)
         return ret;
 
@@ -761,8 +901,7 @@ SR_PRIV int picomso_start_acquisition(const struct sr_dev_inst *sdi)
     if (ret != SR_OK)
         return ret;
 
-    if (status.mode != PICOMSO_MODE_LOGIC ||
-        status.capture_state == PICOMSO_CAPTURE_RUNNING)
+    if (status.mode != mode || status.capture_state == PICOMSO_CAPTURE_RUNNING)
         return SR_ERR;
 
     ret = command_request_capture(sdi, &request);
@@ -771,6 +910,7 @@ SR_PRIV int picomso_start_acquisition(const struct sr_dev_inst *sdi)
 
     devc->acq_aborted = FALSE;
     devc->acq_state = PICOMSO_ACQ_WAITING;
+    devc->capture_mode = mode;
     devc->expected_block_id = 0;
     devc->sent_samples = 0;
 
@@ -783,6 +923,7 @@ SR_PRIV int picomso_start_acquisition(const struct sr_dev_inst *sdi)
         PICOMSO_POLL_INTERVAL_MS, receive_data, (void *)sdi);
     if (ret != SR_OK) {
         devc->acq_state = PICOMSO_ACQ_IDLE;
+        devc->capture_mode = PICOMSO_MODE_UNSET;
         command_set_mode(sdi, PICOMSO_MODE_UNSET);
         return ret;
     }
@@ -791,6 +932,7 @@ SR_PRIV int picomso_start_acquisition(const struct sr_dev_inst *sdi)
     if (ret != SR_OK) {
         sr_session_source_remove(sdi->session, -1);
         devc->acq_state = PICOMSO_ACQ_IDLE;
+        devc->capture_mode = PICOMSO_MODE_UNSET;
         command_set_mode(sdi, PICOMSO_MODE_UNSET);
     }
 

@@ -32,7 +32,9 @@
 
 #define USB_INTERFACE                   0
 #define USB_CONFIGURATION               1
+
 #define NUM_CHANNELS                    16
+#define NUM_ANALOG_CHANNELS             1
 
 #define PICOMSO_USB_TIMEOUT_MS          500
 #define PICOMSO_POLL_INTERVAL_MS        10
@@ -169,8 +171,12 @@ struct dev_context {
 
     gboolean acq_aborted;
     enum picomso_acq_state acq_state;
+    enum picomso_device_mode capture_mode;
+
     uint16_t expected_block_id;
     gint64 capture_deadline_us;
+
+    GSList *enabled_analog_channels;
 };
 
 SR_PRIV int picomso_dev_open(struct sr_dev_inst *sdi, struct sr_dev_driver *di);
