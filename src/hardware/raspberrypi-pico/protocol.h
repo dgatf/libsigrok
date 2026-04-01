@@ -54,6 +54,45 @@ typedef enum rxstate {
 	RX_ABORT = 3,		/* Received aborted marker or other error */
 } rxstate_t;
 
+enum picomso_protocol_version {
+	PICOMSO_PROTOCOL_V2 = 2,
+	PICOMSO_PROTOCOL_V3 = 3,
+};
+
+enum picomso_mode {
+	PICOMSO_MODE_LOGIC = 0,
+	PICOMSO_MODE_SCOPE = 1,
+	PICOMSO_MODE_MIXED = 2,
+};
+
+enum picomso_stream_index {
+	PICOMSO_STREAM_INDEX_LOGIC = 0,
+	PICOMSO_STREAM_INDEX_SCOPE = 1,
+	PICOMSO_STREAM_COUNT = 2,
+};
+
+enum picomso_stream_type {
+	PICOMSO_STREAM_TYPE_LOGIC = 1,
+	PICOMSO_STREAM_TYPE_SCOPE = 2,
+};
+
+enum picomso_stream_flags {
+	PICOMSO_STREAM_FLAG_NONE = 0,
+	PICOMSO_STREAM_FLAG_D4 = (1 << 0),
+};
+
+#define PICOMSO_BLOCK_MAGIC 0x1e
+#define PICOMSO_STREAM_MASK_LOGIC (1 << PICOMSO_STREAM_INDEX_LOGIC)
+#define PICOMSO_STREAM_MASK_SCOPE (1 << PICOMSO_STREAM_INDEX_SCOPE)
+
+struct picomso_data_block {
+	uint8_t magic;
+	uint8_t block_id;
+	uint8_t stream_type;
+	uint8_t stream_flags;
+	uint16_t data_len;
+} __attribute__((packed));
+
 struct dev_context {
 	/* Configuration Parameters
 	 * It is up to the user to understand sample rates and serial download speed
@@ -64,6 +103,9 @@ struct dev_context {
 	uint64_t sample_rate;
 	/* Number of samples that have been received and processed */
 	uint32_t num_samples;
+	uint8_t protocol_version;
+	enum picomso_mode mode;
+	uint8_t active_stream_mask;
 	/* Initial Number of analog and digital channels.
 	 * This is set by initial device config. Channels can be disabled/enabled,
 	 * but can not be added/removed once driver is loaded. */
@@ -85,6 +127,8 @@ struct dev_context {
 	uint64_t capture_ratio;
 	/* Total number of bytes of data sent for one sample across all channels */
 	uint16_t bytes_per_slice;
+	uint16_t logic_bytes_per_slice;
+	uint16_t scope_bytes_per_slice;
 	/* The number of bytes needed to store all channels for one sample in the
 	 * device data buffer */
 	uint32_t dig_sample_bytes;
@@ -94,8 +138,12 @@ struct dev_context {
 	uint32_t bytes_avail;
 	/* Samples sent to the session */
 	uint32_t sent_samples;
+	uint32_t stream_sent_samples[PICOMSO_STREAM_COUNT];
 	/* count total received bytes to detect lost info */
 	uint64_t byte_cnt;
+	uint64_t stream_byte_cnt[PICOMSO_STREAM_COUNT];
+	uint8_t stream_next_block[PICOMSO_STREAM_COUNT];
+	gboolean stream_block_seen[PICOMSO_STREAM_COUNT];
 	/* For SW-based triggering we put the device into continuous transmit and
 	 * stop when we detect a sample and capture all the samples we need.
 	 * trigger_fired is thus set when the sw trigger logic detects a trigger.
@@ -147,6 +195,7 @@ SR_PRIV int raspberrypi_pico_get_dev_cfg(const struct sr_dev_inst *sdi);
 
 void process_D4(struct sr_dev_inst *sdi, struct dev_context *d);
 void process_slice(struct sr_dev_inst *sdi, struct dev_context *devc);
+int process_data_blocks(struct sr_dev_inst *sdi, struct dev_context *devc);
 
 int send_analog(struct sr_dev_inst *sdi, struct dev_context *devc,
 	uint32_t num_samples, uint32_t offset);

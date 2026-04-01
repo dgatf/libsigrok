@@ -120,9 +120,36 @@ static const uint32_t devopts[] = {
 	SR_CONF_TRIGGER_MATCH | SR_CONF_LIST,
 	SR_CONF_CAPTURE_RATIO | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_SAMPLERATE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_DEVICE_MODE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 };
 
 static struct sr_dev_driver raspberrypi_pico_driver_info;
+
+static const char *device_modes[] = {
+	"logic",
+	"scope",
+	"mixed",
+};
+
+static const char *picomso_mode_to_string(enum picomso_mode mode)
+{
+	if (mode >= ARRAY_SIZE(device_modes))
+		return device_modes[PICOMSO_MODE_LOGIC];
+
+	return device_modes[mode];
+}
+
+static int picomso_mode_from_string(const char *mode)
+{
+	if (!strcmp(mode, "logic"))
+		return PICOMSO_MODE_LOGIC;
+	if (!strcmp(mode, "scope"))
+		return PICOMSO_MODE_SCOPE;
+	if (!strcmp(mode, "mixed"))
+		return PICOMSO_MODE_MIXED;
+
+	return -1;
+}
 
 
 static GSList *scan(struct sr_dev_driver *di, GSList * options)
@@ -138,7 +165,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 	const char *conn, *serialcomm, *force_detect;
 	char buf[32];
 	char ustr[64];
-	int len;
+	int len, proto_ver;
 	uint8_t num_a, num_d, a_size;
 	gchar *channel_name;
 
@@ -211,14 +238,16 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 	/* Expected ID response is SRPICO,AxxyDzz,VV
 	 * where xx are number of analog channels, y is bytes per analog sample
 	 * (7 bits per byte), zz is number of digital channels, and VV is two digit
-	 * version# which must be 02 */
+	 * protocol version. */
+	buf[num_read] = '\0';
 	if ((num_read < 16) || (strncmp(buf, "SRPICO,A", 8)) \
-		|| (buf[11] != 'D') || (buf[15] != '0') || (buf[16] != '2')) {
+		|| (buf[11] != 'D')) {
 		sr_err("ERROR: Bad response string %s %d", buf, num_read);
 		return NULL;
 	}
 
 	a_size = buf[10] - '0';
+	proto_ver = atoi(&buf[15]);
 	buf[10] = '\0';		/*Null to end the str for atois */
 	buf[14] = '\0';		
 	num_a = atoi(&buf[8]);
@@ -228,7 +257,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 	sdi->status = SR_ST_INACTIVE;
 	sdi->vendor = g_strdup("Raspberry Pi");
 	sdi->model = g_strdup("PICO");
-	sdi->version = g_strdup("00");
+	sdi->version = g_strdup_printf("%02d", proto_ver);
 	sdi->conn = serial;
 	sdi->driver = &raspberrypi_pico_driver_info;
 	sdi->inst_type = SR_INST_SERIAL;
@@ -236,7 +265,9 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 
 	if (((num_a == 0) && (num_d == 0)) \
 		|| (num_a > MAX_ANALOG_CHANNELS) || (num_d > MAX_DIGITAL_CHANNELS)
-		|| (a_size < 1) || (a_size > 4)) {
+		|| (a_size < 1) || (a_size > 4)
+		|| (proto_ver < PICOMSO_PROTOCOL_V2)
+		|| (proto_ver > PICOMSO_PROTOCOL_V3)) {
 		sr_err("ERROR: invalid channel config a %d d %d asz %d",
 			num_a, num_d, a_size);
 		return NULL;
@@ -244,10 +275,13 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 
 	devc = g_malloc0(sizeof(struct dev_context));
 	devc->a_size = a_size;
+	devc->protocol_version = proto_ver;
 	devc->num_a_channels = num_a;
 	devc->num_d_channels = num_d;
 	devc->a_chan_mask = ((1 << num_a) - 1);
 	devc->d_chan_mask = ((1 << num_d) - 1);
+	devc->mode = (num_a && num_d) ? PICOMSO_MODE_MIXED :
+		(num_d ? PICOMSO_MODE_LOGIC : PICOMSO_MODE_SCOPE);
 
 	/* The number of bytes that each digital sample in the buffers sent to the
 	 * session. All logical channels are packed together, where a slice of N
@@ -258,10 +292,12 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 	/* These are the slice sizes of the data on the wire
 	 * 1 7 bit field per byte */
 	devc->bytes_per_slice = (devc->num_a_channels * devc->a_size);
+	devc->scope_bytes_per_slice = devc->bytes_per_slice;
 
 	if (devc->num_d_channels > 0) {
 		/* logic sent in groups of 7*/
-		devc->bytes_per_slice += (devc->num_d_channels + 6) / 7;
+		devc->logic_bytes_per_slice = (devc->num_d_channels + 6) / 7;
+		devc->bytes_per_slice += devc->logic_bytes_per_slice;
 	}
 	sr_dbg("num channels a %d d %d bps %d dsb %d", num_a, num_d,
 		devc->bytes_per_slice, devc->dig_sample_bytes);
@@ -364,6 +400,13 @@ static int config_set(uint32_t key, GVariant * data,
 	case SR_CONF_CAPTURE_RATIO:
 		devc->capture_ratio = g_variant_get_uint64(data);
 		break;
+	case SR_CONF_DEVICE_MODE:
+		ret = picomso_mode_from_string(g_variant_get_string(data, NULL));
+		if (ret < 0)
+			return SR_ERR_ARG;
+		devc->mode = ret;
+		ret = SR_OK;
+		break;
 
 	default:
 		sr_err("ERROR: config_set given undefined key %d\n", key);
@@ -401,6 +444,9 @@ static int config_get(uint32_t key, GVariant ** data,
 		sr_spew("config_get limit_samples of %lu", devc->limit_samples);
 		*data = g_variant_new_uint64(devc->limit_samples);
 		break;
+	case SR_CONF_DEVICE_MODE:
+		*data = g_variant_new_string(picomso_mode_to_string(devc->mode));
+		break;
 	default:
 		sr_spew("unsupported config_get key %d", key);
 		return SR_ERR_NA;
@@ -411,6 +457,8 @@ static int config_get(uint32_t key, GVariant ** data,
 static int config_list(uint32_t key, GVariant ** data,
 	const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
 {
+	struct dev_context *devc;
+
 	(void) cg;
 
 	/* Scan or device options are the only ones that can be called without a
@@ -424,6 +472,7 @@ static int config_list(uint32_t key, GVariant ** data,
 		return SR_ERR_ARG;
 	}
 
+	devc = sdi->priv;
 	sr_dbg("Start config_list with key %X", key);
 	switch (key) {
 	case SR_CONF_SAMPLERATE:
@@ -438,6 +487,14 @@ static int config_list(uint32_t key, GVariant ** data,
 		 * and users that pick huge values deserve what they get.
 		 * But setting this limit to prevent really crazy things. */
 		*data = std_gvar_tuple_u64(1LL, 1000000000LL);
+		break;
+	case SR_CONF_DEVICE_MODE:
+		if (devc->num_a_channels && devc->num_d_channels)
+			*data = std_gvar_array_str(ARRAY_AND_SIZE(device_modes));
+		else if (devc->num_d_channels)
+			*data = g_variant_new_strv(&device_modes[PICOMSO_MODE_LOGIC], 1);
+		else
+			*data = g_variant_new_strv(&device_modes[PICOMSO_MODE_SCOPE], 1);
 		break;
 	default:
 		sr_dbg("Reached default statement of config_list");
@@ -458,6 +515,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	char buf[32];
 	GSList *l;
 	int a_enabled = 0, d_enabled = 0, len;
+	enum picomso_mode actual_mode;
 	serial = sdi->conn;
 	int i, num_read;
 
@@ -526,14 +584,34 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 
 	/* Recalculate bytes_per_slice based on which analog channels are enabled */
 	devc->bytes_per_slice = (a_enabled * devc->a_size);
+	devc->scope_bytes_per_slice = devc->bytes_per_slice;
+	devc->logic_bytes_per_slice = 0;
 
 	for (i = 0; i < devc->num_d_channels; i += 7)
-		if (((devc->d_chan_mask) >> i) & (0x7F))
+		if (((devc->d_chan_mask) >> i) & (0x7F)) {
 			(devc->bytes_per_slice)++;
+			devc->logic_bytes_per_slice++;
+		}
 
 	if ((a_enabled == 0) && (d_enabled == 0)) {
 		sr_err("ERROR:No channels enabled");
 		return SR_ERR;
+	}
+
+	actual_mode = d_enabled && a_enabled ? PICOMSO_MODE_MIXED :
+		(d_enabled ? PICOMSO_MODE_LOGIC : PICOMSO_MODE_SCOPE);
+	devc->mode = actual_mode;
+	devc->active_stream_mask = 0;
+	if (d_enabled)
+		devc->active_stream_mask |= PICOMSO_STREAM_MASK_LOGIC;
+	if (a_enabled)
+		devc->active_stream_mask |= PICOMSO_STREAM_MASK_SCOPE;
+
+	if ((actual_mode == PICOMSO_MODE_MIXED) &&
+	    (devc->protocol_version < PICOMSO_PROTOCOL_V3)) {
+		sr_err("ERROR: protocol v%u does not support mixed streaming",
+			devc->protocol_version);
+		return SR_ERR_NA;
 	}
 
 	sr_dbg("bps %d\n", devc->bytes_per_slice);
@@ -601,6 +679,14 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		return SR_ERR;
 	}
 
+	if (devc->protocol_version >= PICOMSO_PROTOCOL_V3) {
+		sprintf(tmpstr, "M%d\n", devc->mode);
+		if (send_serial_w_ack(serial, tmpstr) != SR_OK) {
+			sr_err("Device mode to device failed");
+			return SR_ERR;
+		}
+	}
+
 	/* To support future devices that may allow the analog scale/offset to
 	 * change, call get_dev_cfg again to get new values */
 	if (raspberrypi_pico_get_dev_cfg(sdi) != SR_OK) {
@@ -633,6 +719,10 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->bytes_avail = 0;
 	devc->wrptr = 0;
 	devc->cbuf_wrptr = 0;
+	memset(devc->stream_sent_samples, 0, sizeof(devc->stream_sent_samples));
+	memset(devc->stream_byte_cnt, 0, sizeof(devc->stream_byte_cnt));
+	memset(devc->stream_next_block, 0, sizeof(devc->stream_next_block));
+	memset(devc->stream_block_seen, 0, sizeof(devc->stream_block_seen));
 	len = serial_read_blocking(serial, devc->buffer, devc->serial_buffer_size,
 		serial_timeout(serial, 4));
 
@@ -668,6 +758,10 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	 * likely may not be used by the device, unless HW based triggers are
 	 * implemented */
 	if ((trigger = sr_session_trigger_get(sdi->session))) {
+		if (devc->mode == PICOMSO_MODE_MIXED) {
+			sr_err("ERROR: mixed mode trigger coordination is not yet supported");
+			return SR_ERR_NA;
+		}
 		if (g_slist_length(trigger->stages) > 1)
 			return SR_ERR_NA;
 
@@ -831,6 +925,13 @@ static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 			g_free(devc->a_pretrig_bufs[i]);
 		devc->a_pretrig_bufs[i] = NULL;
 	}
+
+	if (devc->stl) {
+		soft_trigger_logic_free(devc->stl);
+		devc->stl = NULL;
+	}
+
+	devc->active_stream_mask = 0;
 
 	serial = sdi->conn;
 	serial_source_remove(sdi->session, serial);

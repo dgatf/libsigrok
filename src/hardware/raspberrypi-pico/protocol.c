@@ -31,6 +31,22 @@
 #include "libsigrok-internal.h"
 #include "protocol.h"
 
+static int send_logic(struct sr_dev_inst *sdi, struct dev_context *devc,
+	uint32_t num_samples, uint32_t offset);
+static void sync_legacy_stream_counts(struct dev_context *devc);
+static void update_stream_total(struct dev_context *devc);
+static gboolean sample_limit_reached(struct dev_context *devc);
+static int flush_logic_stream(struct sr_dev_inst *sdi, struct dev_context *devc,
+	uint32_t num_samples);
+static int flush_scope_stream(struct sr_dev_inst *sdi, struct dev_context *devc,
+	uint32_t num_samples);
+static void analog_rle_memset(struct dev_context *devc, uint32_t num_slices);
+static int process_logic_block(struct sr_dev_inst *sdi, struct dev_context *devc,
+	const uint8_t *payload, uint16_t data_len, uint8_t stream_flags);
+static int process_scope_block(struct sr_dev_inst *sdi, struct dev_context *devc,
+	const uint8_t *payload, uint16_t data_len);
+static int stream_index_from_type(uint8_t stream_type);
+
 SR_PRIV int send_serial_str(struct sr_serial_dev_inst *serial, char *str)
 {
 	int len = strlen(str);
@@ -342,6 +358,148 @@ void process_slice(struct sr_dev_inst *sdi, struct dev_context *devc)
 
 }
 
+static int send_logic(struct sr_dev_inst *sdi, struct dev_context *devc,
+	uint32_t num_samples, uint32_t offset)
+{
+	struct sr_datafeed_logic logic;
+	struct sr_datafeed_packet packet;
+
+	if (!devc->num_d_channels || !num_samples)
+		return SR_OK;
+
+	packet.type = SR_DF_LOGIC;
+	packet.payload = &logic;
+	logic.unitsize = devc->dig_sample_bytes;
+	logic.length = num_samples * logic.unitsize;
+	logic.data = devc->d_data_buf + (offset * logic.unitsize);
+
+	sr_session_send(sdi, &packet);
+
+	return SR_OK;
+}
+
+static void update_stream_total(struct dev_context *devc)
+{
+	devc->sent_samples = MAX(devc->stream_sent_samples[PICOMSO_STREAM_INDEX_LOGIC],
+		devc->stream_sent_samples[PICOMSO_STREAM_INDEX_SCOPE]);
+}
+
+static void sync_legacy_stream_counts(struct dev_context *devc)
+{
+	if (devc->d_chan_mask)
+		devc->stream_sent_samples[PICOMSO_STREAM_INDEX_LOGIC] =
+			devc->sent_samples;
+	if (devc->a_chan_mask)
+		devc->stream_sent_samples[PICOMSO_STREAM_INDEX_SCOPE] =
+			devc->sent_samples;
+
+	update_stream_total(devc);
+}
+
+static gboolean sample_limit_reached(struct dev_context *devc)
+{
+	if (!devc->limit_samples)
+		return FALSE;
+
+	if ((devc->active_stream_mask & PICOMSO_STREAM_MASK_LOGIC) &&
+	    (devc->stream_sent_samples[PICOMSO_STREAM_INDEX_LOGIC] <
+	     devc->limit_samples))
+		return FALSE;
+
+	if ((devc->active_stream_mask & PICOMSO_STREAM_MASK_SCOPE) &&
+	    (devc->stream_sent_samples[PICOMSO_STREAM_INDEX_SCOPE] <
+	     devc->limit_samples))
+		return FALSE;
+
+	return devc->active_stream_mask != 0;
+}
+
+static int flush_logic_stream(struct sr_dev_inst *sdi, struct dev_context *devc,
+	uint32_t num_samples)
+{
+	uint32_t to_send;
+
+	if (!num_samples)
+		return SR_OK;
+
+	to_send = num_samples;
+	if (devc->limit_samples &&
+	    (devc->stream_sent_samples[PICOMSO_STREAM_INDEX_LOGIC] >=
+	     devc->limit_samples))
+		to_send = 0;
+	else if (devc->limit_samples &&
+	    (to_send >
+	     devc->limit_samples -
+	     devc->stream_sent_samples[PICOMSO_STREAM_INDEX_LOGIC]))
+		to_send = devc->limit_samples -
+			devc->stream_sent_samples[PICOMSO_STREAM_INDEX_LOGIC];
+
+	if (to_send)
+		send_logic(sdi, devc, to_send, 0);
+
+	devc->stream_sent_samples[PICOMSO_STREAM_INDEX_LOGIC] += to_send;
+	update_stream_total(devc);
+	devc->cbuf_wrptr = 0;
+
+	return SR_OK;
+}
+
+static int flush_scope_stream(struct sr_dev_inst *sdi, struct dev_context *devc,
+	uint32_t num_samples)
+{
+	uint32_t to_send;
+
+	if (!num_samples)
+		return SR_OK;
+
+	to_send = num_samples;
+	if (devc->limit_samples &&
+	    (devc->stream_sent_samples[PICOMSO_STREAM_INDEX_SCOPE] >=
+	     devc->limit_samples))
+		to_send = 0;
+	else if (devc->limit_samples &&
+	    (to_send >
+	     devc->limit_samples -
+	     devc->stream_sent_samples[PICOMSO_STREAM_INDEX_SCOPE]))
+		to_send = devc->limit_samples -
+			devc->stream_sent_samples[PICOMSO_STREAM_INDEX_SCOPE];
+
+	if (to_send)
+		send_analog(sdi, devc, to_send, 0);
+
+	devc->stream_sent_samples[PICOMSO_STREAM_INDEX_SCOPE] += to_send;
+	update_stream_total(devc);
+	devc->cbuf_wrptr = 0;
+
+	return SR_OK;
+}
+
+static void analog_rle_memset(struct dev_context *devc, uint32_t num_slices)
+{
+	uint32_t i, j;
+
+	for (j = 0; j < num_slices; j++) {
+		for (i = 0; i < devc->num_a_channels; i++) {
+			if ((devc->a_chan_mask >> i) & 1)
+				devc->a_data_bufs[i][devc->cbuf_wrptr] =
+					devc->a_last[i];
+		}
+		devc->cbuf_wrptr++;
+	}
+}
+
+static int stream_index_from_type(uint8_t stream_type)
+{
+	switch (stream_type) {
+	case PICOMSO_STREAM_TYPE_LOGIC:
+		return PICOMSO_STREAM_INDEX_LOGIC;
+	case PICOMSO_STREAM_TYPE_SCOPE:
+		return PICOMSO_STREAM_INDEX_SCOPE;
+	default:
+		return -1;
+	}
+}
+
 /* Send the processed analog values to the session */
 int send_analog(struct sr_dev_inst *sdi, struct dev_context *devc,
 		uint32_t num_samples, uint32_t offset)
@@ -464,8 +622,6 @@ int process_group(struct sr_dev_inst *sdi, struct dev_context *devc,
 	int pre_trigger_samples;
 	/*  These are samples sent to session and are less than num_slices if we reach limit_samples */
 	size_t num_samples;
-	struct sr_datafeed_logic logic;
-	struct sr_datafeed_packet packet;
 	int i;
 	size_t cbuf_wrptr_cpy;
 	cbuf_wrptr_cpy = devc->cbuf_wrptr;
@@ -484,20 +640,12 @@ int process_group(struct sr_dev_inst *sdi, struct dev_context *devc,
 		if (num_samples > 0) {
 			sr_spew("Process_group sending %lu post trig samples dsb %d",
 				num_samples, devc->dig_sample_bytes);
-			if (devc->num_d_channels) {
-				packet.type = SR_DF_LOGIC;
-				packet.payload = &logic;
-				/* The number of bytes required to fit all of the channels */
-				logic.unitsize = devc->dig_sample_bytes;
-				/* The total length of the array sent */
-				logic.length = num_samples * logic.unitsize;
-				logic.data = devc->d_data_buf;
-				sr_session_send(sdi, &packet);
-			}
+			send_logic(sdi, devc, num_samples, 0);
 			send_analog(sdi, devc, num_samples, 0);
 		}
 
 		devc->sent_samples += num_samples;
+		sync_legacy_stream_counts(devc);
 		return 0;
 
 	} else {
@@ -521,6 +669,8 @@ int process_group(struct sr_dev_inst *sdi, struct dev_context *devc,
 		 * samples, but we must send any post trigger logic and all pre and post
 		 * trigger analog signals */
 		if (trigger_offset > -1) {
+			struct sr_datafeed_logic logic;
+			struct sr_datafeed_packet packet;
 			devc->trigger_fired = TRUE;
 			devc->sent_samples += pre_trigger_samples;
 			packet.type = SR_DF_LOGIC;
@@ -591,6 +741,7 @@ int process_group(struct sr_dev_inst *sdi, struct dev_context *devc,
 				send_analog_ring(sdi, devc, ring_samples);
 			if (new_samples)
 				send_analog(sdi, devc, new_samples, new_start);
+			sync_legacy_stream_counts(devc);
 		} else {
 			/* We didn't trigger but need to copy to ring buffer */
 			if ((devc->a_chan_mask) && (devc->pretrig_entries)) {
@@ -663,6 +814,256 @@ void rle_memset(struct dev_context *devc, uint32_t num_slices)
 	}
 }
 
+static int process_logic_block(struct sr_dev_inst *sdi, struct dev_context *devc,
+	const uint8_t *payload, uint16_t data_len, uint8_t stream_flags)
+{
+	uint32_t idx, rlecnt, didx;
+	uint32_t i, slice_bytes;
+	uint8_t cbyte, cval;
+	uint32_t cword;
+
+	devc->cbuf_wrptr = 0;
+
+	if (stream_flags & PICOMSO_STREAM_FLAG_D4) {
+		rlecnt = 0;
+		for (idx = 0; idx < data_len; idx++) {
+			cbyte = payload[idx];
+			if ((cbyte >= 48) && (cbyte <= 127)) {
+				rlecnt += (cbyte - 47) * 8;
+			} else if (cbyte >= 0x80) {
+				rlecnt += (cbyte & 0x70) >> 4;
+				if (rlecnt) {
+					rle_memset(devc, rlecnt);
+					rlecnt = 0;
+				}
+
+				cval = cbyte & 0xF;
+				didx = devc->cbuf_wrptr * devc->dig_sample_bytes;
+				devc->d_data_buf[didx] = cval;
+				for (i = 1; i < devc->dig_sample_bytes; i++)
+					devc->d_data_buf[didx + i] = 0;
+				devc->d_last[0] = cval;
+				devc->d_last[1] = 0;
+				devc->d_last[2] = 0;
+				devc->d_last[3] = 0;
+				devc->cbuf_wrptr++;
+			} else {
+				sr_err("Invalid D4 logic payload byte 0x%02x", cbyte);
+				return SR_ERR_DATA;
+			}
+
+			if ((rlecnt >= 2000) ||
+			    ((rlecnt + (devc->cbuf_wrptr << 2)) >
+			     (devc->sample_buf_size - 1024))) {
+				rle_memset(devc, rlecnt);
+				rlecnt = 0;
+				flush_logic_stream(sdi, devc, devc->cbuf_wrptr);
+			}
+		}
+
+		if (rlecnt)
+			rle_memset(devc, rlecnt);
+		if (devc->cbuf_wrptr)
+			flush_logic_stream(sdi, devc, devc->cbuf_wrptr);
+
+		return SR_OK;
+	}
+
+	slice_bytes = devc->logic_bytes_per_slice;
+	idx = 0;
+	while (((idx + slice_bytes) <= data_len) ||
+	       ((idx < data_len) && (payload[idx] < 0x80))) {
+		if (payload[idx] < 0x80) {
+			int16_t rlecnt16;
+
+			if (payload[idx] <= 79)
+				rlecnt16 = payload[idx] - 47;
+			else
+				rlecnt16 = (payload[idx] - 78) * 32;
+			if ((rlecnt16 < 1) || (rlecnt16 > 1568)) {
+				sr_err("Bad logic rlecnt val %d in %d", rlecnt16,
+					payload[idx]);
+				return SR_ERR_DATA;
+			}
+			rle_memset(devc, rlecnt16);
+			idx++;
+		} else {
+			cword = 0;
+			for (i = 0; i < devc->num_d_channels; i += 7) {
+				if (((devc->d_chan_mask >> i) & 0x7F) == 0)
+					continue;
+				cword |= (payload[idx] & 0x7F) << i;
+				idx++;
+			}
+
+			devc->d_last[0] = cword & 0xFF;
+			devc->d_last[1] = (cword >> 8) & 0xFF;
+			devc->d_last[2] = (cword >> 16) & 0xFF;
+			devc->d_last[3] = (cword >> 24) & 0xFF;
+			for (i = 0; i < devc->num_d_channels; i += 8) {
+				didx = (devc->cbuf_wrptr * devc->dig_sample_bytes) +
+					(i >> 3);
+				devc->d_data_buf[didx] = cword & 0xFF;
+				cword >>= 8;
+			}
+			devc->cbuf_wrptr++;
+		}
+
+		if ((devc->cbuf_wrptr + 2048) > devc->sample_buf_size)
+			flush_logic_stream(sdi, devc, devc->cbuf_wrptr);
+	}
+
+	if (idx != data_len) {
+		sr_err("Incomplete logic block payload %u/%u", idx, data_len);
+		return SR_ERR_DATA;
+	}
+
+	if (devc->cbuf_wrptr)
+		flush_logic_stream(sdi, devc, devc->cbuf_wrptr);
+
+	return SR_OK;
+}
+
+static int process_scope_block(struct sr_dev_inst *sdi, struct dev_context *devc,
+	const uint8_t *payload, uint16_t data_len)
+{
+	uint32_t idx, slice_bytes;
+	uint32_t i;
+	uint32_t tmp32;
+
+	devc->cbuf_wrptr = 0;
+	slice_bytes = devc->scope_bytes_per_slice;
+	idx = 0;
+
+	while (((idx + slice_bytes) <= data_len) ||
+	       ((idx < data_len) && (payload[idx] < 0x80))) {
+		if (payload[idx] < 0x80) {
+			int16_t rlecnt;
+
+			if (payload[idx] <= 79)
+				rlecnt = payload[idx] - 47;
+			else
+				rlecnt = (payload[idx] - 78) * 32;
+			if ((rlecnt < 1) || (rlecnt > 1568)) {
+				sr_err("Bad scope rlecnt val %d in %d", rlecnt,
+					payload[idx]);
+				return SR_ERR_DATA;
+			}
+			analog_rle_memset(devc, rlecnt);
+			idx++;
+		} else {
+			for (i = 0; i < devc->num_a_channels; i++) {
+				uint32_t a;
+
+				if (((devc->a_chan_mask >> i) & 1) == 0)
+					continue;
+
+				tmp32 = payload[idx] - 0x80;
+				for (a = 1; a < devc->a_size; a++)
+					tmp32 += (payload[idx + a] - 0x80) << (7 * a);
+				devc->a_data_bufs[i][devc->cbuf_wrptr] =
+					((float)tmp32 * devc->a_scale[i]) +
+					devc->a_offset[i];
+				devc->a_last[i] =
+					devc->a_data_bufs[i][devc->cbuf_wrptr];
+				idx += devc->a_size;
+			}
+			devc->cbuf_wrptr++;
+		}
+
+		if ((devc->cbuf_wrptr + 2048) > devc->sample_buf_size)
+			flush_scope_stream(sdi, devc, devc->cbuf_wrptr);
+	}
+
+	if (idx != data_len) {
+		sr_err("Incomplete scope block payload %u/%u", idx, data_len);
+		return SR_ERR_DATA;
+	}
+
+	if (devc->cbuf_wrptr)
+		flush_scope_stream(sdi, devc, devc->cbuf_wrptr);
+
+	return SR_OK;
+}
+
+int process_data_blocks(struct sr_dev_inst *sdi, struct dev_context *devc)
+{
+	struct picomso_data_block block;
+	uint16_t data_len;
+	uint32_t block_len;
+	uint8_t stream_type;
+	int stream_idx;
+	int ret;
+
+	while (devc->ser_rdptr < devc->bytes_avail) {
+		if (devc->buffer[devc->ser_rdptr] == '$') {
+			devc->rxstate = RX_STOPPED;
+			break;
+		}
+
+		if ((devc->bytes_avail - devc->ser_rdptr) < sizeof(block))
+			break;
+
+		memcpy(&block, devc->buffer + devc->ser_rdptr, sizeof(block));
+		if (block.magic != PICOMSO_BLOCK_MAGIC) {
+			sr_err("Invalid block magic 0x%02x at %u", block.magic,
+				devc->ser_rdptr);
+			devc->rxstate = RX_ABORT;
+			break;
+		}
+
+		data_len = GUINT16_FROM_LE(block.data_len);
+		block_len = sizeof(block) + data_len;
+		if ((devc->bytes_avail - devc->ser_rdptr) < block_len)
+			break;
+
+		stream_type = block.stream_type;
+		stream_idx = stream_index_from_type(stream_type);
+		if (stream_idx < 0) {
+			sr_err("Unknown stream type %u", stream_type);
+			devc->rxstate = RX_ABORT;
+			break;
+		}
+
+		if (!(devc->active_stream_mask & (1 << stream_idx))) {
+			sr_err("Unexpected inactive stream type %u", stream_type);
+			devc->rxstate = RX_ABORT;
+			break;
+		}
+
+		if (devc->stream_block_seen[stream_idx] &&
+		    (uint8_t)(devc->stream_next_block[stream_idx]) != block.block_id) {
+			sr_err("Unexpected block id %u for stream %u expected %u",
+				block.block_id, stream_type,
+				devc->stream_next_block[stream_idx]);
+			devc->rxstate = RX_ABORT;
+			break;
+		}
+
+		devc->stream_block_seen[stream_idx] = TRUE;
+		devc->stream_next_block[stream_idx] = block.block_id + 1;
+		devc->byte_cnt += block_len;
+		devc->stream_byte_cnt[stream_idx] += block_len;
+
+		if (stream_type == PICOMSO_STREAM_TYPE_LOGIC)
+			ret = process_logic_block(sdi, devc,
+				devc->buffer + devc->ser_rdptr + sizeof(block),
+				data_len, block.stream_flags);
+		else
+			ret = process_scope_block(sdi, devc,
+				devc->buffer + devc->ser_rdptr + sizeof(block),
+				data_len);
+		if (ret != SR_OK) {
+			devc->rxstate = RX_ABORT;
+			break;
+		}
+
+		devc->ser_rdptr += block_len;
+	}
+
+	return (devc->rxstate == RX_ABORT) ? SR_ERR_DATA : SR_OK;
+}
+
 /* This callback function is mapped from api.c with serial_source_add and is
  * created after a capture has been setup and is responsible for querying the
  * device trigger status, downloading data and forwarding packets */
@@ -730,7 +1131,9 @@ SR_PRIV int raspberrypi_pico_receive(int fd, int revents, void *cb_data)
 	/* Process the serial read data */
 	devc->ser_rdptr = 0;
 	if (devc->rxstate == RX_ACTIVE) {
-		if ((devc->a_chan_mask == 0) \
+		if (devc->protocol_version >= PICOMSO_PROTOCOL_V3)
+			process_data_blocks(sdi, devc);
+		else if ((devc->a_chan_mask == 0) \
 			&& ((devc->d_chan_mask & 0xFFFFFFF0) == 0))
 			process_D4(sdi, devc);
 		else
@@ -804,7 +1207,7 @@ SR_PRIV int raspberrypi_pico_receive(int fd, int revents, void *cb_data)
 	 * need to stop the device.  Not that even in non continous mode there might
 	 * be cases where get an extra sample or two... */
 
-	if ((devc->sent_samples >= devc->limit_samples) \
+	if (sample_limit_reached(devc) \
 		&& (devc->rxstate == RX_ACTIVE)) {
 		sr_dbg("Ending: sent %u of limit %lu samples byte_cnt %lu",
 			devc->sent_samples, devc->limit_samples, devc->byte_cnt);
