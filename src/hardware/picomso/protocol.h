@@ -182,7 +182,8 @@ struct dev_context {
     uint64_t cur_samplerate;
     uint64_t limit_samples;
     uint64_t capture_ratio;
-    uint64_t sent_samples;
+    uint64_t sent_logic_samples;
+    uint64_t sent_scope_samples;
 
     uint32_t capabilities;
     struct picomso_info info;

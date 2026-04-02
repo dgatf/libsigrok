@@ -555,8 +555,8 @@ static int send_logic_data(struct sr_dev_inst *sdi,
     sample_count = block->data_len / sizeof(uint16_t);
 
     if (devc->limit_samples &&
-        devc->sent_samples + sample_count > devc->limit_samples) {
-        sample_count = (size_t)(devc->limit_samples - devc->sent_samples);
+        devc->sent_logic_samples + sample_count > devc->limit_samples) {
+        sample_count = (size_t)(devc->limit_samples - devc->sent_logic_samples);
     }
 
     if (sample_count == 0u)
@@ -569,7 +569,7 @@ static int send_logic_data(struct sr_dev_inst *sdi,
     packet.type = SR_DF_LOGIC;
     packet.payload = &logic;
 
-    devc->sent_samples += sample_count;
+    devc->sent_logic_samples += sample_count;
 
     return sr_session_send(sdi, &packet);
 }
@@ -596,8 +596,8 @@ static int send_scope_analog_data(struct sr_dev_inst *sdi,
     sample_count = block->data_len / 2u;
 
     if (devc->limit_samples &&
-        devc->sent_samples + sample_count > devc->limit_samples) {
-        sample_count = (size_t)(devc->limit_samples - devc->sent_samples);
+        devc->sent_scope_samples + sample_count > devc->limit_samples) {
+        sample_count = (size_t)(devc->limit_samples - devc->sent_scope_samples);
     }
 
     if (sample_count == 0u)
@@ -622,7 +622,7 @@ static int send_scope_analog_data(struct sr_dev_inst *sdi,
     packet.type = SR_DF_ANALOG;
     packet.payload = &analog;
 
-    devc->sent_samples += sample_count;
+    devc->sent_scope_samples += sample_count;
 
     return sr_session_send(sdi, &packet);
 }
@@ -647,7 +647,8 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
     devc->expected_logic_block_id = 0;
     devc->expected_scope_block_id = 0;
     devc->capture_deadline_us = 0;
-    devc->sent_samples = 0;
+    devc->sent_logic_samples = 0;
+    devc->sent_scope_samples = 0;
 
     g_slist_free(devc->enabled_analog_channels);
     devc->enabled_analog_channels = NULL;
@@ -884,7 +885,8 @@ SR_PRIV struct dev_context *picomso_dev_new(void)
     devc->cur_samplerate = 0;
     devc->limit_samples = PICOMSO_DEFAULT_LIMIT_SAMPLES;
     devc->capture_ratio = 0;
-    devc->sent_samples = 0;
+    devc->sent_logic_samples = 0;
+    devc->sent_scope_samples = 0;
     devc->next_seq = 1u;
     devc->last_device_status = PICOMSO_STATUS_OK;
     devc->acq_state = PICOMSO_ACQ_IDLE;
@@ -957,12 +959,13 @@ SR_PRIV int picomso_start_acquisition(const struct sr_dev_inst *sdi)
     devc->enabled_streams = streams;
     devc->expected_logic_block_id = 0;
     devc->expected_scope_block_id = 0;
-    devc->sent_samples = 0;
+    devc->sent_logic_samples = 0;
+    devc->sent_scope_samples = 0;
 
     capture_time_us = ((gint64)request.total_samples * G_USEC_PER_SEC)
         / request.rate;
     devc->capture_deadline_us = g_get_monotonic_time()
-        + capture_time_us + (3 * G_USEC_PER_SEC);
+        + capture_time_us + (600 * G_USEC_PER_SEC);
 
     ret = sr_session_source_add(sdi->session, -1, 0,
         PICOMSO_POLL_INTERVAL_MS, receive_data, (void *)sdi);
