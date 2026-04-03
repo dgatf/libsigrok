@@ -37,7 +37,7 @@ static const uint32_t drvopts[] = {
 };
 
 static const uint32_t devopts[] = {
-    SR_CONF_LIMIT_SAMPLES | SR_CONF_GET | SR_CONF_SET,
+    SR_CONF_LIMIT_SAMPLES | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
     SR_CONF_CONN | SR_CONF_GET,
     SR_CONF_SAMPLERATE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
     SR_CONF_TRIGGER_MATCH | SR_CONF_LIST,
@@ -66,6 +66,7 @@ static const uint64_t samplerates[] = {
     SR_MHZ(20),
     SR_MHZ(50),
     SR_MHZ(100),
+    SR_MHZ(200),
 };
 
 static const char *channel_names_logic[] = {
@@ -374,13 +375,13 @@ static int config_set(uint32_t key, GVariant *data,
         break;
     case SR_CONF_LIMIT_SAMPLES:
         value = g_variant_get_uint64(data);
-        if (value == 0 || value > PICOMSO_MAX_TOTAL_SAMPLES)
+        if (value == 0 || value > PICOMSO_MAX_POST_TRIGGER_SAMPLES)
             return SR_ERR_ARG;
         devc->limit_samples = value;
         break;
     case SR_CONF_CAPTURE_RATIO:
         value = g_variant_get_uint64(data);
-        if (value > 100)
+        if (value > 10)
             return SR_ERR_ARG;
         devc->capture_ratio = value;
         break;
@@ -405,6 +406,11 @@ static int config_list(uint32_t key, GVariant **data,
             return SR_ERR_NA;
         return STD_CONFIG_LIST(key, data, sdi, cg,
             scanopts, drvopts, devopts);
+    case SR_CONF_LIMIT_SAMPLES:
+    *data = g_variant_new("(tt)",
+        (guint64)1,
+        (guint64)PICOMSO_MAX_POST_TRIGGER_SAMPLES);
+    break;
     case SR_CONF_SAMPLERATE:
         if (!devc)
             return SR_ERR_NA;

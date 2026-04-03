@@ -475,28 +475,32 @@ static int build_capture_request(const struct sr_dev_inst *sdi,
     struct sr_trigger_stage *stage;
     struct sr_trigger_match *match;
     const GSList *l;
-    uint64_t total_samples;
+    uint64_t post_trigger_samples;
     uint64_t pre_trigger_samples;
+    uint64_t total_samples;
     unsigned int trigger_index;
     int ret;
 
     devc = sdi->priv;
     memset(request, 0, sizeof(*request));
 
-    total_samples = devc->limit_samples ?
+    post_trigger_samples = devc->limit_samples ?
         devc->limit_samples : PICOMSO_DEFAULT_LIMIT_SAMPLES;
 
-    if (total_samples == 0 || total_samples > PICOMSO_MAX_TOTAL_SAMPLES)
+    if (post_trigger_samples == 0
+        || post_trigger_samples > PICOMSO_MAX_POST_TRIGGER_SAMPLES)
         return SR_ERR_ARG;
     if (devc->cur_samplerate == 0)
         return SR_ERR_ARG;
     if (devc->capture_ratio > 100)
         return SR_ERR_ARG;
 
-    pre_trigger_samples = (devc->capture_ratio * total_samples) / 100;
+    pre_trigger_samples = (devc->capture_ratio * post_trigger_samples) / 100;
     if (pre_trigger_samples > PICOMSO_MAX_PRE_TRIGGER_SAMPLES)
         return SR_ERR_ARG;
-    if (total_samples - pre_trigger_samples > PICOMSO_MAX_POST_TRIGGER_SAMPLES)
+
+    total_samples = pre_trigger_samples + post_trigger_samples;
+    if (total_samples > PICOMSO_MAX_TOTAL_SAMPLES)
         return SR_ERR_ARG;
 
     request->total_samples = (uint32_t)total_samples;
