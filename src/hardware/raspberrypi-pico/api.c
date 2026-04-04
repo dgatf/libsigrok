@@ -306,8 +306,15 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 	sr_dbg("Setting serial buffer size: %i.", devc->serial_buffer_size);
 
 	devc->cbuf_wrptr = 0;
-	devc->enabled_a_channels = devc->num_a_channels;
-	devc->a_cur_chan = devc->num_a_channels ? 0 : MAX_ANALOG_CHANNELS;
+	devc->enabled_a_channels = 0;
+	devc->a_cur_chan = MAX_ANALOG_CHANNELS;
+	for (i = 0; i < devc->num_a_channels; i++) {
+		if ((devc->a_chan_mask >> i) & 1) {
+			if (devc->a_cur_chan == MAX_ANALOG_CHANNELS)
+				devc->a_cur_chan = i;
+			devc->enabled_a_channels++;
+		}
+	}
 	devc->a_chunk_chan = devc->a_cur_chan;
 	/* Sigrok wants analog channel data sent as separate packets while logic
 	 * values stay packed together. An RLE byte in normal mode can represent up

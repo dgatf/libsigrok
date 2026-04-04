@@ -118,7 +118,7 @@ static void analog_get_range(const struct dev_context *devc, uint32_t offset,
 
 	for (i = 0; i < devc->enabled_a_channels; i++) {
 		channel = ordered_channels[i];
-		analog_offsets[channel] = start_cycles + (i < start_rem);
+		analog_offsets[channel] = start_cycles + (i >= start_rem);
 		analog_counts[channel] = end_cycles + (i < end_rem) -
 			analog_offsets[channel];
 	}
