@@ -315,7 +315,7 @@ static int command_set_mode(const struct sr_dev_inst *sdi,
 static int command_request_capture(const struct sr_dev_inst *sdi,
     const struct picomso_request_capture *request)
 {
-    uint8_t payload[12u + PICOMSO_REQUEST_CAPTURE_TRIGGER_COUNT * 3u];
+    uint8_t payload[12u + PICOMSO_REQUEST_CAPTURE_TRIGGER_COUNT * 3u + 1u];
     uint8_t response[PICOMSO_PROTOCOL_IO_BUFFER_SIZE];
     size_t response_len;
     size_t offset;
@@ -335,6 +335,10 @@ static int command_request_capture(const struct sr_dev_inst *sdi,
         payload[offset + 1u] = request->trigger[i].pin;
         payload[offset + 2u] = request->trigger[i].match;
     }
+
+    /* Byte 24: analog channel selection mask (A0=bit0, A1=bit1, ...). */
+    payload[12u + PICOMSO_REQUEST_CAPTURE_TRIGGER_COUNT * 3u] =
+        request->analog_channel_mask;
 
     ret = send_request(sdi, PICOMSO_MSG_REQUEST_CAPTURE, payload,
         (uint16_t)sizeof(payload), PICOMSO_RESPONSE_TYPE_REQUEST,
@@ -474,6 +478,7 @@ static int build_capture_request(const struct sr_dev_inst *sdi,
     struct sr_trigger *trigger;
     struct sr_trigger_stage *stage;
     struct sr_trigger_match *match;
+    struct sr_channel *ch;
     const GSList *l;
     uint64_t post_trigger_samples;
     uint64_t pre_trigger_samples;
@@ -506,6 +511,20 @@ static int build_capture_request(const struct sr_dev_inst *sdi,
     request->total_samples = (uint32_t)total_samples;
     request->rate = (uint32_t)devc->cur_samplerate;
     request->pre_trigger_samples = (uint32_t)pre_trigger_samples;
+
+    /*
+     * Build the analog channel mask from the enabled analog channel list.
+     * Bit N = analog channel N (A0=bit0, A1=bit1, ...).  Each channel's
+     * hardware analog index is its global index minus NUM_CHANNELS (the
+     * number of logic channels that precede the analog channels).
+     */
+    request->analog_channel_mask = 0u;
+    for (l = devc->enabled_analog_channels; l; l = l->next) {
+        ch = l->data;
+        if (ch->index >= NUM_CHANNELS)
+            request->analog_channel_mask |=
+                (uint8_t)(1u << (ch->index - NUM_CHANNELS));
+    }
 
     trigger = sr_session_trigger_get(sdi->session);
     if (!trigger)
@@ -591,7 +610,7 @@ static int send_scope_analog_data(struct sr_dev_inst *sdi,
     size_t sample_count, num_channels, per_channel, ch_idx, raw_idx, i;
     uint16_t raw;
     const GSList *l;
-    GSList ch_node;
+    GSList ch_node = {0};
     int ret;
 
     devc = sdi->priv;

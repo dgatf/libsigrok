@@ -151,6 +151,13 @@ struct picomso_request_capture {
     uint32_t rate;
     uint32_t pre_trigger_samples;
     struct picomso_trigger_config trigger[PICOMSO_REQUEST_CAPTURE_TRIGGER_COUNT];
+    /*
+     * Bitmask of selected analog channels to capture.  Bit N corresponds
+     * to analog channel N (A0=bit0, A1=bit1, ...).  The firmware captures
+     * only the selected channels and interleaves them in ascending channel
+     * index order.  Set to 0 when the scope stream is not active.
+     */
+    uint8_t analog_channel_mask;
 };
 
 struct picomso_info {
