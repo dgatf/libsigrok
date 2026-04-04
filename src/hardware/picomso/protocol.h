@@ -34,7 +34,7 @@
 #define USB_CONFIGURATION               1
 
 #define NUM_CHANNELS                    16
-#define NUM_ANALOG_CHANNELS             1
+#define NUM_ANALOG_CHANNELS             2
 
 #define PICOMSO_USB_TIMEOUT_MS          500
 #define PICOMSO_POLL_INTERVAL_MS        10

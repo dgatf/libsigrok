@@ -588,9 +588,11 @@ static int send_scope_analog_data(struct sr_dev_inst *sdi,
     struct sr_analog_meaning meaning;
     struct sr_analog_spec spec;
     float samples[PICOMSO_DATA_BLOCK_SIZE / 2];
-    size_t sample_count;
-    size_t i;
+    size_t sample_count, num_channels, per_channel, ch_idx, raw_idx, i;
     uint16_t raw;
+    const GSList *l;
+    GSList *ch_list;
+    int ret;
 
     devc = sdi->priv;
 
@@ -599,36 +601,60 @@ static int send_scope_analog_data(struct sr_dev_inst *sdi,
 
     sample_count = block->data_len / 2u;
 
+    /*
+     * N = number of enabled analog channels; incoming samples are
+     * interleaved: channel k receives raw samples at indices k, k+N,
+     * k+2N, ... Truncate to a whole number of N-sample frames.
+     */
+    num_channels = (size_t)g_slist_length(devc->enabled_analog_channels);
+    if (num_channels == 0u)
+        return SR_OK;
+
+    sample_count -= sample_count % num_channels;
+
     if (devc->limit_samples &&
         devc->sent_scope_samples + sample_count > devc->limit_samples) {
         sample_count = (size_t)(devc->limit_samples - devc->sent_scope_samples);
+        sample_count -= sample_count % num_channels;
     }
 
     if (sample_count == 0u)
         return SR_OK;
 
-    for (i = 0; i < sample_count; i++) {
-        raw = (uint16_t)block->data[2u * i]
-            | ((uint16_t)block->data[2u * i + 1u] << 8);
+    per_channel = sample_count / num_channels;
 
-        raw &= 0x0FFFu;
-        samples[i] = (3.3f * (float)raw) / 4095.0f;
+    /* Emit one analog packet per enabled channel with demultiplexed samples. */
+    for (ch_idx = 0, l = devc->enabled_analog_channels; l;
+            l = l->next, ch_idx++) {
+        for (i = 0; i < per_channel; i++) {
+            raw_idx = i * num_channels + ch_idx;
+            raw = (uint16_t)block->data[2u * raw_idx]
+                | ((uint16_t)block->data[2u * raw_idx + 1u] << 8);
+            raw &= 0x0FFFu;
+            samples[i] = (3.3f * (float)raw) / 4095.0f;
+        }
+
+        ch_list = g_slist_append(NULL, l->data);
+        sr_analog_init(&analog, &encoding, &meaning, &spec, 2);
+        analog.meaning->channels = ch_list;
+        analog.meaning->mq = SR_MQ_VOLTAGE;
+        analog.meaning->unit = SR_UNIT_VOLT;
+        analog.meaning->mqflags = 0;
+        analog.num_samples = per_channel;
+        analog.data = samples;
+
+        packet.type = SR_DF_ANALOG;
+        packet.payload = &analog;
+
+        ret = sr_session_send(sdi, &packet);
+        g_slist_free(ch_list);
+        if (ret != SR_OK)
+            return ret;
     }
-
-    sr_analog_init(&analog, &encoding, &meaning, &spec, 2);
-    analog.meaning->channels = devc->enabled_analog_channels;
-    analog.meaning->mq = SR_MQ_VOLTAGE;
-    analog.meaning->unit = SR_UNIT_VOLT;
-    analog.meaning->mqflags = 0;
-    analog.num_samples = sample_count;
-    analog.data = samples;
-
-    packet.type = SR_DF_ANALOG;
-    packet.payload = &analog;
 
     devc->sent_scope_samples += sample_count;
 
-    return sr_session_send(sdi, &packet);
+    return SR_OK;
 }
 
 static void finish_acquisition(struct sr_dev_inst *sdi)
