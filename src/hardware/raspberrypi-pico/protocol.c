@@ -400,9 +400,9 @@ void process_slice(struct sr_dev_inst *sdi, struct dev_context *devc)
 		if (devc->enabled_a_channels) {
 			channel = devc->a_cur_chan;
 			tmp32 = devc->buffer[devc->ser_rdptr] - 0x80;
-			for (int a = 1; a < devc->a_size; a++)
-				tmp32 += (devc->buffer[devc->ser_rdptr + a] - 0x80) <<
-					(7 * a);
+			for (int byte_index = 1; byte_index < devc->a_size; byte_index++)
+				tmp32 += (devc->buffer[devc->ser_rdptr + byte_index] - 0x80) <<
+					(7 * byte_index);
 			analog_store_sample(devc, channel, tmp32);
 			sr_spew("AChan %d t32 %d value %f wrptr %d rdptr %d sc %f off %f",
 				channel, tmp32,

@@ -248,6 +248,9 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 	devc->num_d_channels = num_d;
 	devc->a_chan_mask = ((1 << num_a) - 1);
 	devc->d_chan_mask = ((1 << num_d) - 1);
+	devc->enabled_a_channels = num_a;
+	devc->a_cur_chan = num_a ? 0 : MAX_ANALOG_CHANNELS;
+	devc->a_chunk_chan = devc->a_cur_chan;
 
 	/* The number of bytes that each digital sample in the buffers sent to the
 	 * session. All logical channels are packed together, where a slice of N
@@ -257,7 +260,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 	devc->dig_sample_bytes = ((devc->num_d_channels + 7) / 8);
 	/* Each slice carries at most one analog sample, multiplexed in channel
 	 * order when more than one analog channel is enabled. */
-	devc->bytes_per_slice = devc->num_a_channels ? devc->a_size : 0;
+	devc->bytes_per_slice = devc->enabled_a_channels ? devc->a_size : 0;
 
 	if (devc->num_d_channels > 0) {
 		/* logic sent in groups of 7*/
@@ -306,16 +309,6 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 	sr_dbg("Setting serial buffer size: %i.", devc->serial_buffer_size);
 
 	devc->cbuf_wrptr = 0;
-	devc->enabled_a_channels = 0;
-	devc->a_cur_chan = MAX_ANALOG_CHANNELS;
-	for (i = 0; i < devc->num_a_channels; i++) {
-		if ((devc->a_chan_mask >> i) & 1) {
-			if (devc->a_cur_chan == MAX_ANALOG_CHANNELS)
-				devc->a_cur_chan = i;
-			devc->enabled_a_channels++;
-		}
-	}
-	devc->a_chunk_chan = devc->a_cur_chan;
 	/* Sigrok wants analog channel data sent as separate packets while logic
 	 * values stay packed together. An RLE byte in normal mode can represent up
 	 * to 1640 samples. In D4 an RLE byte can represent up to 640 samples.
@@ -743,7 +736,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		if (devc->pretrig_entries > 0) {
 			sr_dbg("Allocating pretrig buffers size %d", devc->pretrig_entries);
 			if (devc->enabled_a_channels > 1) {
-				sr_warn("WARN: Multi-analog captures skip analog pre-trigger " \
+				sr_warn("Multi-analog captures skip analog pre-trigger " \
 					"data buffered before the current chunk.");
 			} else {
 				for (i = 0; i < devc->num_a_channels; i++) {
