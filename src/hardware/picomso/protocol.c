@@ -631,9 +631,17 @@ static int send_scope_analog_data(struct sr_dev_inst *sdi,
 
     sample_count -= sample_count % num_channels;
 
+    /*
+     * limit_samples is a per-channel budget.  The total number of
+     * interleaved samples the driver should forward is therefore
+     * limit_samples * num_channels.
+     */
     if (devc->limit_samples &&
-        devc->sent_scope_samples + sample_count > devc->limit_samples) {
-        sample_count = (size_t)(devc->limit_samples - devc->sent_scope_samples);
+        devc->sent_scope_samples + sample_count >
+            devc->limit_samples * (uint64_t)num_channels) {
+        sample_count = (size_t)(
+            devc->limit_samples * (uint64_t)num_channels
+            - devc->sent_scope_samples);
         sample_count -= sample_count % num_channels;
     }
 

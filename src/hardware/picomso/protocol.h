@@ -34,7 +34,7 @@
 #define USB_CONFIGURATION               1
 
 #define NUM_CHANNELS                    16
-#define NUM_ANALOG_CHANNELS             2
+#define NUM_ANALOG_CHANNELS             3
 
 #define PICOMSO_USB_TIMEOUT_MS          500
 #define PICOMSO_POLL_INTERVAL_MS        10
@@ -45,7 +45,7 @@
 #define PICOMSO_CTRL_REQUEST_OUT        0x01
 
 #define PICOMSO_PROTOCOL_VERSION_MAJOR  0
-#define PICOMSO_PROTOCOL_VERSION_MINOR  3
+#define PICOMSO_PROTOCOL_VERSION_MINOR  4
 
 #define PICOMSO_PACKET_MAGIC            UINT16_C(0x4D53)
 #define PICOMSO_PACKET_HEADER_SIZE      8u
