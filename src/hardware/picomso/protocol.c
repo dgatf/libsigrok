@@ -928,6 +928,12 @@ SR_PRIV int picomso_start_acquisition(const struct sr_dev_inst *sdi)
         return ret;
 
     if ((streams & PICOMSO_STREAM_SCOPE) &&
+        devc->cur_samplerate > SR_MHZ(2)) {
+        sr_err("Analog stream requested with samplerate above 2 MHz.");
+        return SR_ERR_ARG;
+    }
+
+    if ((streams & PICOMSO_STREAM_SCOPE) &&
         (devc->capabilities & PICOMSO_CAP_SCOPE) == 0u) {
         sr_err("This PicoMSO firmware does not expose oscilloscope capability.");
         return SR_ERR_NA;
