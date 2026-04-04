@@ -72,6 +72,9 @@ struct dev_context {
 	/* Masks of enabled channels based on user input */
 	uint32_t a_chan_mask;
 	uint32_t d_chan_mask;
+	uint16_t enabled_a_channels;
+	uint16_t a_cur_chan;
+	uint16_t a_chunk_chan;
 	/* Channel groups - each analog channel is its own group */
 	struct sr_channel_group **analog_groups;
 	struct sr_channel_group *digital_group;
@@ -124,6 +127,7 @@ struct dev_context {
 	uint8_t *d_data_buf;
 	/* Write pointer for the the per channel data buffers */
 	uint32_t cbuf_wrptr;
+	uint32_t a_buf_wrptrs[MAX_ANALOG_CHANNELS];
 	/* Size of packet data buffers for each channel */
 	uint32_t sample_buf_size;
 

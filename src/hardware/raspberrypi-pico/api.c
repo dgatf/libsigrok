@@ -255,9 +255,9 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 	 * are disabled because PV expects disabled channels to still be accounted
 	 * for in the packing */
 	devc->dig_sample_bytes = ((devc->num_d_channels + 7) / 8);
-	/* These are the slice sizes of the data on the wire
-	 * 1 7 bit field per byte */
-	devc->bytes_per_slice = (devc->num_a_channels * devc->a_size);
+	/* Each slice carries at most one analog sample, multiplexed in channel
+	 * order when more than one analog channel is enabled. */
+	devc->bytes_per_slice = devc->num_a_channels ? devc->a_size : 0;
 
 	if (devc->num_d_channels > 0) {
 		/* logic sent in groups of 7*/
@@ -306,9 +306,11 @@ static GSList *scan(struct sr_dev_driver *di, GSList * options)
 	sr_dbg("Setting serial buffer size: %i.", devc->serial_buffer_size);
 
 	devc->cbuf_wrptr = 0;
-	/* While slices are sent as a group of one sample across all channels,
-	 * sigrok wants analog channel data sent as separate packets. Logical trace
-	 * values are packed together. An RLE byte in normal mode can represent up
+	devc->enabled_a_channels = devc->num_a_channels;
+	devc->a_cur_chan = devc->num_a_channels ? 0 : MAX_ANALOG_CHANNELS;
+	devc->a_chunk_chan = devc->a_cur_chan;
+	/* Sigrok wants analog channel data sent as separate packets while logic
+	 * values stay packed together. An RLE byte in normal mode can represent up
 	 * to 1640 samples. In D4 an RLE byte can represent up to 640 samples.
 	 * Rather than making the sample_buf_size 1640x the size of serial buffer,
 	 * we require that the process loops push samples to the session as we get
@@ -525,7 +527,17 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	}
 
 	/* Recalculate bytes_per_slice based on which analog channels are enabled */
-	devc->bytes_per_slice = (a_enabled * devc->a_size);
+	devc->enabled_a_channels = a_enabled;
+	devc->a_cur_chan = MAX_ANALOG_CHANNELS;
+	for (i = 0; i < devc->num_a_channels; i++) {
+		if ((devc->a_chan_mask >> i) & 1) {
+			devc->a_cur_chan = i;
+			break;
+		}
+	}
+	devc->a_chunk_chan = devc->a_cur_chan;
+	memset(devc->a_buf_wrptrs, 0, sizeof(devc->a_buf_wrptrs));
+	devc->bytes_per_slice = a_enabled ? devc->a_size : 0;
 
 	for (i = 0; i < devc->num_d_channels; i += 7)
 		if (((devc->d_chan_mask) >> i) & (0x7F))
@@ -723,14 +735,19 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		devc->trigger_fired = FALSE;
 		if (devc->pretrig_entries > 0) {
 			sr_dbg("Allocating pretrig buffers size %d", devc->pretrig_entries);
-			for (i = 0; i < devc->num_a_channels; i++) {
-				if ((devc->a_chan_mask >> i) & 1) {
-					devc->a_pretrig_bufs[i] = g_malloc0(sizeof(float) *
-						devc->pretrig_entries);
-					if (!devc->a_pretrig_bufs[i]) {
-						sr_err("ERROR:Analog pretrigger buffer malloc " \
-							"failure, disabling");
-						devc->trigger_fired = TRUE;
+			if (devc->enabled_a_channels > 1) {
+				sr_warn("WARN: Multi-analog captures skip analog pre-trigger " \
+					"data buffered before the current chunk.");
+			} else {
+				for (i = 0; i < devc->num_a_channels; i++) {
+					if ((devc->a_chan_mask >> i) & 1) {
+						devc->a_pretrig_bufs[i] = g_malloc0(sizeof(float) *
+							devc->pretrig_entries);
+						if (!devc->a_pretrig_bufs[i]) {
+							sr_err("ERROR:Analog pretrigger buffer malloc " \
+								"failure, disabling");
+							devc->trigger_fired = TRUE;
+						}
 					}
 				}
 			}

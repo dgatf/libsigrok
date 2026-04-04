@@ -31,6 +31,99 @@
 #include "libsigrok-internal.h"
 #include "protocol.h"
 
+static gboolean analog_multiplexed(const struct dev_context *devc)
+{
+	return devc->enabled_a_channels > 1;
+}
+
+static uint16_t first_enabled_analog_channel(const struct dev_context *devc)
+{
+	uint16_t i;
+
+	for (i = 0; i < devc->num_a_channels; i++) {
+		if ((devc->a_chan_mask >> i) & 1)
+			return i;
+	}
+
+	return MAX_ANALOG_CHANNELS;
+}
+
+static uint16_t next_enabled_analog_channel(const struct dev_context *devc,
+		uint16_t channel)
+{
+	uint16_t i;
+
+	if (!devc->enabled_a_channels)
+		return MAX_ANALOG_CHANNELS;
+
+	for (i = channel + 1; i < devc->num_a_channels; i++) {
+		if ((devc->a_chan_mask >> i) & 1)
+			return i;
+	}
+
+	return first_enabled_analog_channel(devc);
+}
+
+static void reset_analog_chunk(struct dev_context *devc)
+{
+	memset(devc->a_buf_wrptrs, 0, sizeof(devc->a_buf_wrptrs));
+	devc->a_chunk_chan = devc->a_cur_chan;
+}
+
+static void analog_store_sample(struct dev_context *devc, uint16_t channel,
+		uint32_t raw_value)
+{
+	float value;
+
+	value = ((float)raw_value * devc->a_scale[channel]) + devc->a_offset[channel];
+	devc->a_data_bufs[channel][devc->a_buf_wrptrs[channel]++] = value;
+	devc->a_last[channel] = value;
+	devc->a_cur_chan = next_enabled_analog_channel(devc, channel);
+}
+
+static void analog_get_range(const struct dev_context *devc, uint32_t offset,
+		uint32_t num_slices, uint32_t *analog_offsets,
+		uint32_t *analog_counts)
+{
+	uint16_t ordered_channels[MAX_ANALOG_CHANNELS];
+	uint16_t channel;
+	uint32_t start_cycles, end_cycles, start_rem, end_rem;
+	uint16_t i;
+
+	memset(analog_offsets, 0, sizeof(uint32_t) * MAX_ANALOG_CHANNELS);
+	memset(analog_counts, 0, sizeof(uint32_t) * MAX_ANALOG_CHANNELS);
+	if (!devc->enabled_a_channels || !num_slices)
+		return;
+
+	if (!analog_multiplexed(devc)) {
+		for (i = 0; i < devc->num_a_channels; i++) {
+			if ((devc->a_chan_mask >> i) & 1) {
+				analog_offsets[i] = offset;
+				analog_counts[i] = num_slices;
+			}
+		}
+		return;
+	}
+
+	channel = devc->a_chunk_chan;
+	for (i = 0; i < devc->enabled_a_channels; i++) {
+		ordered_channels[i] = channel;
+		channel = next_enabled_analog_channel(devc, channel);
+	}
+
+	start_cycles = offset / devc->enabled_a_channels;
+	start_rem = offset % devc->enabled_a_channels;
+	end_cycles = (offset + num_slices) / devc->enabled_a_channels;
+	end_rem = (offset + num_slices) % devc->enabled_a_channels;
+
+	for (i = 0; i < devc->enabled_a_channels; i++) {
+		channel = ordered_channels[i];
+		analog_offsets[channel] = start_cycles + (i < start_rem);
+		analog_counts[channel] = end_cycles + (i < end_rem) -
+			analog_offsets[channel];
+	}
+}
+
 SR_PRIV int send_serial_str(struct sr_serial_dev_inst *serial, char *str)
 {
 	int len = strlen(str);
@@ -227,6 +320,7 @@ void process_slice(struct sr_dev_inst *sdi, struct dev_context *devc)
 	int32_t i;
 	uint32_t tmp32, cword;
 	uint8_t cbyte;
+	uint16_t channel;
 	uint32_t slice_bytes;	/* Number of bytes that have legal slice values including RLE */
 
 	/* Only process legal data values for this mode which are 0x32-0x7F for RLE and 0x80 to 0xFF for data*/
@@ -300,30 +394,23 @@ void process_slice(struct sr_dev_inst *sdi, struct dev_context *devc)
 			cword >>= 8;
 		}
 
-		/* Each analog value is one or more 7 bit values */
-		for (i = 0; i < devc->num_a_channels; i++) {
-			if ((devc->a_chan_mask >> i) & 1) {
-
-				tmp32 =
-				    devc->buffer[devc->ser_rdptr] - 0x80;
-				for(int a=1;a<devc->a_size;a++){
-                                    tmp32+=(devc->buffer[(devc->ser_rdptr)+a] - 0x80)<<(7*a);
-                                }
-				devc->a_data_bufs[i][devc->cbuf_wrptr] =
-				    ((float) tmp32 * devc->a_scale[i]) +
-				    devc->a_offset[i];
-				devc->a_last[i] =
-				    devc->a_data_bufs[i][devc->cbuf_wrptr];
-				sr_spew
-				    ("AChan %d t32 %d value %f wrptr %d rdptr %d sc %f off %f",
-				     i, tmp32,
-				     devc->
-				     a_data_bufs[i][devc->cbuf_wrptr],
-				     devc->cbuf_wrptr, devc->ser_rdptr,
-				     devc->a_scale[i], devc->a_offset[i]);
-				devc->ser_rdptr+=devc->a_size;
-			}	/*if channel enabled*/
-		}		/*for num_a_channels*/
+		/* Each slice carries at most one analog value. For captures with more
+		 * than one enabled analog channel the firmware multiplexes them in
+		 * channel order across successive slices. */
+		if (devc->enabled_a_channels) {
+			channel = devc->a_cur_chan;
+			tmp32 = devc->buffer[devc->ser_rdptr] - 0x80;
+			for (int a = 1; a < devc->a_size; a++)
+				tmp32 += (devc->buffer[devc->ser_rdptr + a] - 0x80) <<
+					(7 * a);
+			analog_store_sample(devc, channel, tmp32);
+			sr_spew("AChan %d t32 %d value %f wrptr %d rdptr %d sc %f off %f",
+				channel, tmp32,
+				devc->a_data_bufs[channel][devc->a_buf_wrptrs[channel] - 1],
+				devc->a_buf_wrptrs[channel] - 1, devc->ser_rdptr,
+				devc->a_scale[channel], devc->a_offset[channel]);
+			devc->ser_rdptr += devc->a_size;
+		}
 		devc->cbuf_wrptr++;
 	  }/*Not an RLE */
            /*RLEs can create a large number of samples relative to the incoming serial buffer
@@ -352,21 +439,24 @@ int send_analog(struct sr_dev_inst *sdi, struct dev_context *devc,
 	struct sr_analog_meaning meaning;
 	struct sr_analog_spec spec;
 	struct sr_channel *ch;
+	uint32_t analog_offsets[MAX_ANALOG_CHANNELS];
+	uint32_t analog_counts[MAX_ANALOG_CHANNELS];
 	uint32_t i;
 	float *fptr;
 
 	sr_analog_init(&analog, &encoding, &meaning, &spec, ANALOG_DIGITS);
+	analog_get_range(devc, offset, num_samples, analog_offsets, analog_counts);
 	for (i = 0; i < devc->num_a_channels; i++) {
-		if ((devc->a_chan_mask >> i) & 1) {
+		if (((devc->a_chan_mask >> i) & 1) && analog_counts[i]) {
 			ch = devc->analog_groups[i]->channels->data;
 			analog.meaning->channels =
 			    g_slist_append(NULL, ch);
-			analog.num_samples = num_samples;
-			analog.data = (devc->a_data_bufs[i]) + offset;
+			analog.num_samples = analog_counts[i];
+			analog.data = (devc->a_data_bufs[i]) + analog_offsets[i];
 			fptr = analog.data;
 			sr_spew
 			    ("send analog num %d offset %d first %f 2 %f",
-			     num_samples, offset, *(devc->a_data_bufs[i]),
+			     analog.num_samples, analog_offsets[i], *(devc->a_data_bufs[i]),
 			     *fptr);
 			analog.meaning->mq = SR_MQ_VOLTAGE;
 			analog.meaning->unit = SR_UNIT_VOLT;
@@ -396,6 +486,10 @@ int send_analog_ring(struct sr_dev_inst *sdi, struct dev_context *devc,
 	int i;
 	uint32_t num_pre, start_pre;
 	uint32_t num_post, start_post;
+
+	if (analog_multiplexed(devc))
+		return 0;
+
 	num_pre =
 	    (num_samples >=
 	     devc->pretrig_wr_ptr) ? devc->pretrig_wr_ptr : num_samples;
@@ -498,6 +592,7 @@ int process_group(struct sr_dev_inst *sdi, struct dev_context *devc,
 		}
 
 		devc->sent_samples += num_samples;
+		reset_analog_chunk(devc);
 		return 0;
 
 	} else {
@@ -587,13 +682,14 @@ int process_group(struct sr_dev_inst *sdi, struct dev_context *devc,
 					"new_samp %zu ring_samp %zu",
 				new_start, new_end, new_samples, ring_samples);
 
-			if (ring_samples > 0)
+			if (ring_samples > 0 && !analog_multiplexed(devc))
 				send_analog_ring(sdi, devc, ring_samples);
 			if (new_samples)
 				send_analog(sdi, devc, new_samples, new_start);
 		} else {
 			/* We didn't trigger but need to copy to ring buffer */
-			if ((devc->a_chan_mask) && (devc->pretrig_entries)) {
+			if ((devc->a_chan_mask) && (devc->pretrig_entries) &&
+					!analog_multiplexed(devc)) {
 				/*The incoming data buffer could be much larger than the ring
 				 * buffer, so never copy more than the size of the ring buffer */
 				num_ring_samples = num_slices > devc->pretrig_entries ?
@@ -638,6 +734,7 @@ int process_group(struct sr_dev_inst *sdi, struct dev_context *devc,
 		}
 	}
 
+	reset_analog_chunk(devc);
 	return 0;
 }
 
@@ -647,6 +744,7 @@ int process_group(struct sr_dev_inst *sdi, struct dev_context *devc,
 void rle_memset(struct dev_context *devc, uint32_t num_slices)
 {
 	uint32_t j, k, didx;
+	uint16_t channel;
 	sr_spew("rle_memset vals 0x%X, 0x%X, 0x%X slices %d dsb %d",
 		devc->d_last[0], devc->d_last[1], devc->d_last[2],
 		num_slices, devc->dig_sample_bytes);
@@ -657,6 +755,12 @@ void rle_memset(struct dev_context *devc, uint32_t num_slices)
 		didx = devc->cbuf_wrptr * devc->dig_sample_bytes;
 		for (k = 0; k < devc->dig_sample_bytes; k++)
 			devc->d_data_buf[didx + k] =  devc->d_last[k];
+		if (devc->enabled_a_channels) {
+			channel = devc->a_cur_chan;
+			devc->a_data_bufs[channel][devc->a_buf_wrptrs[channel]++] =
+				devc->a_last[channel];
+			devc->a_cur_chan = next_enabled_analog_channel(devc, channel);
+		}
 		/* cbuf_wrptr always counts slices/samples (and not the bytes in the
 		 * buffer) regardless of mode */
 		devc->cbuf_wrptr++;
