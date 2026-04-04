@@ -591,7 +591,7 @@ static int send_scope_analog_data(struct sr_dev_inst *sdi,
     size_t sample_count, num_channels, per_channel, ch_idx, raw_idx, i;
     uint16_t raw;
     const GSList *l;
-    GSList *ch_list;
+    GSList ch_node;
     int ret;
 
     devc = sdi->priv;
@@ -634,9 +634,10 @@ static int send_scope_analog_data(struct sr_dev_inst *sdi,
             samples[i] = (3.3f * (float)raw) / 4095.0f;
         }
 
-        ch_list = g_slist_append(NULL, l->data);
+        ch_node.data = l->data;
+        ch_node.next = NULL;
         sr_analog_init(&analog, &encoding, &meaning, &spec, 2);
-        analog.meaning->channels = ch_list;
+        analog.meaning->channels = &ch_node;
         analog.meaning->mq = SR_MQ_VOLTAGE;
         analog.meaning->unit = SR_UNIT_VOLT;
         analog.meaning->mqflags = 0;
@@ -647,7 +648,6 @@ static int send_scope_analog_data(struct sr_dev_inst *sdi,
         packet.payload = &analog;
 
         ret = sr_session_send(sdi, &packet);
-        g_slist_free(ch_list);
         if (ret != SR_OK)
             return ret;
     }
