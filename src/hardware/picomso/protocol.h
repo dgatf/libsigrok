@@ -34,7 +34,7 @@
 #define USB_CONFIGURATION               1
 
 #define NUM_CHANNELS                    16
-#define NUM_ANALOG_CHANNELS             1
+#define NUM_ANALOG_CHANNELS             3
 
 #define PICOMSO_USB_TIMEOUT_MS          500
 #define PICOMSO_POLL_INTERVAL_MS        10
@@ -45,14 +45,14 @@
 #define PICOMSO_CTRL_REQUEST_OUT        0x01
 
 #define PICOMSO_PROTOCOL_VERSION_MAJOR  0
-#define PICOMSO_PROTOCOL_VERSION_MINOR  3
+#define PICOMSO_PROTOCOL_VERSION_MINOR  4
 
 #define PICOMSO_PACKET_MAGIC            UINT16_C(0x4D53)
 #define PICOMSO_PACKET_HEADER_SIZE      8u
 
 #define PICOMSO_DEFAULT_LIMIT_SAMPLES   1024u
 #define PICOMSO_MAX_PRE_TRIGGER_SAMPLES 1024u
-#define PICOMSO_MAX_POST_TRIGGER_SAMPLES 50000u
+#define PICOMSO_MAX_POST_TRIGGER_SAMPLES 40000u
 #define PICOMSO_MAX_TOTAL_SAMPLES \
     (PICOMSO_MAX_PRE_TRIGGER_SAMPLES + PICOMSO_MAX_POST_TRIGGER_SAMPLES)
 
@@ -151,6 +151,13 @@ struct picomso_request_capture {
     uint32_t rate;
     uint32_t pre_trigger_samples;
     struct picomso_trigger_config trigger[PICOMSO_REQUEST_CAPTURE_TRIGGER_COUNT];
+    /*
+     * Bitmask of selected analog channels to capture.  Bit N corresponds
+     * to analog channel N (A0=bit0, A1=bit1, ...).  The firmware captures
+     * only the selected channels and interleaves them in ascending channel
+     * index order.  Set to 0 when the scope stream is not active.
+     */
+    uint8_t analog_channel_mask;
 };
 
 struct picomso_info {

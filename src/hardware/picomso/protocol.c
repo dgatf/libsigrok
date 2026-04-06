@@ -315,7 +315,7 @@ static int command_set_mode(const struct sr_dev_inst *sdi,
 static int command_request_capture(const struct sr_dev_inst *sdi,
     const struct picomso_request_capture *request)
 {
-    uint8_t payload[12u + PICOMSO_REQUEST_CAPTURE_TRIGGER_COUNT * 3u];
+    uint8_t payload[12u + PICOMSO_REQUEST_CAPTURE_TRIGGER_COUNT * 3u + 1u];
     uint8_t response[PICOMSO_PROTOCOL_IO_BUFFER_SIZE];
     size_t response_len;
     size_t offset;
@@ -335,6 +335,10 @@ static int command_request_capture(const struct sr_dev_inst *sdi,
         payload[offset + 1u] = request->trigger[i].pin;
         payload[offset + 2u] = request->trigger[i].match;
     }
+
+    /* Byte 24: analog channel selection mask (A0=bit0, A1=bit1, ...). */
+    payload[12u + PICOMSO_REQUEST_CAPTURE_TRIGGER_COUNT * 3u] =
+        request->analog_channel_mask;
 
     ret = send_request(sdi, PICOMSO_MSG_REQUEST_CAPTURE, payload,
         (uint16_t)sizeof(payload), PICOMSO_RESPONSE_TYPE_REQUEST,
@@ -418,6 +422,18 @@ static int trigger_match_to_picomso(enum sr_trigger_matches match,
     return SR_OK;
 }
 
+static gint compare_channel_index(gconstpointer a, gconstpointer b)
+{
+    const struct sr_channel *cha = a;
+    const struct sr_channel *chb = b;
+
+    if (cha->index < chb->index)
+        return -1;
+    if (cha->index > chb->index)
+        return 1;
+    return 0;
+}
+
 static int configure_capture_streams(const struct sr_dev_inst *sdi,
     uint8_t *streams)
 {
@@ -454,6 +470,9 @@ static int configure_capture_streams(const struct sr_dev_inst *sdi,
         }
     }
 
+    devc->enabled_analog_channels =
+        g_slist_sort(devc->enabled_analog_channels, compare_channel_index);
+
     if (enabled_logic > 0)
         *streams |= PICOMSO_STREAM_LOGIC;
     if (enabled_analog > 0)
@@ -474,6 +493,7 @@ static int build_capture_request(const struct sr_dev_inst *sdi,
     struct sr_trigger *trigger;
     struct sr_trigger_stage *stage;
     struct sr_trigger_match *match;
+    struct sr_channel *ch;
     const GSList *l;
     uint64_t post_trigger_samples;
     uint64_t pre_trigger_samples;
@@ -506,6 +526,20 @@ static int build_capture_request(const struct sr_dev_inst *sdi,
     request->total_samples = (uint32_t)total_samples;
     request->rate = (uint32_t)devc->cur_samplerate;
     request->pre_trigger_samples = (uint32_t)pre_trigger_samples;
+
+    /*
+     * Build the analog channel mask from the enabled analog channel list.
+     * Bit N = analog channel N (A0=bit0, A1=bit1, ...).  Each channel's
+     * hardware analog index is its global index minus NUM_CHANNELS (the
+     * number of logic channels that precede the analog channels).
+     */
+    request->analog_channel_mask = 0u;
+    for (l = devc->enabled_analog_channels; l; l = l->next) {
+        ch = l->data;
+        if (ch->index >= NUM_CHANNELS)
+            request->analog_channel_mask |=
+                (uint8_t)(1u << (ch->index - NUM_CHANNELS));
+    }
 
     trigger = sr_session_trigger_get(sdi->session);
     if (!trigger)
@@ -588,47 +622,94 @@ static int send_scope_analog_data(struct sr_dev_inst *sdi,
     struct sr_analog_meaning meaning;
     struct sr_analog_spec spec;
     float samples[PICOMSO_DATA_BLOCK_SIZE / 2];
-    size_t sample_count;
-    size_t i;
+    size_t sample_count, num_channels, per_channel, ch_idx, raw_idx, i;
     uint16_t raw;
+    const GSList *l;
+    GSList ch_node = {0};
+    int ret;
 
     devc = sdi->priv;
 
+    /*
+     * Scope payload format:
+     *
+     * - The firmware always sends scope samples as little-endian 16-bit words.
+     * - Single-channel analog mode uses native 12-bit ADC samples in bits 11:0.
+     * - Dual-channel analog mode may internally capture 8-bit samples, but the
+     *   firmware expands them to a 12-bit-equivalent range before transmission.
+     *
+     * Therefore the host always consumes 16-bit little-endian samples and
+     * scales them as 12-bit values after masking with 0x0FFF.
+     */
     if ((block->data_len % 2u) != 0u)
         return SR_ERR;
 
     sample_count = block->data_len / 2u;
 
+    /*
+     * N = number of enabled analog channels; incoming samples are interleaved:
+     * channel k receives raw samples at indices k, k+N, k+2N, ...
+     * Truncate to a whole number of N-sample frames.
+     */
+    num_channels = (size_t)g_slist_length(devc->enabled_analog_channels);
+    if (num_channels == 0u)
+        return SR_OK;
+
+    sample_count -= sample_count % num_channels;
+
+    /*
+     * limit_samples is a per-channel budget. The total number of interleaved
+     * samples the driver should forward is therefore limit_samples * num_channels.
+     */
     if (devc->limit_samples &&
-        devc->sent_scope_samples + sample_count > devc->limit_samples) {
-        sample_count = (size_t)(devc->limit_samples - devc->sent_scope_samples);
+        devc->sent_scope_samples + sample_count >
+            devc->limit_samples * (uint64_t)num_channels) {
+        sample_count = (size_t)(
+            devc->limit_samples * (uint64_t)num_channels
+            - devc->sent_scope_samples);
+        sample_count -= sample_count % num_channels;
     }
 
     if (sample_count == 0u)
         return SR_OK;
 
-    for (i = 0; i < sample_count; i++) {
-        raw = (uint16_t)block->data[2u * i]
-            | ((uint16_t)block->data[2u * i + 1u] << 8);
+    per_channel = sample_count / num_channels;
 
-        raw &= 0x0FFFu;
-        samples[i] = (3.3f * (float)raw) / 4095.0f;
+    /* Emit one analog packet per enabled channel with demultiplexed samples. */
+    for (ch_idx = 0, l = devc->enabled_analog_channels; l;
+            l = l->next, ch_idx++) {
+        for (i = 0; i < per_channel; i++) {
+            raw_idx = i * num_channels + ch_idx;
+            raw = (uint16_t)block->data[2u * raw_idx]
+                | ((uint16_t)block->data[2u * raw_idx + 1u] << 8);
+
+            /* Scope samples are always transported as 12-bit-scaled values. */
+            raw &= 0x0FFFu;
+            samples[i] = (3.3f * (float)raw) / 4095.0f;
+        }
+
+        ch_node.data = l->data;
+        ch_node.next = NULL;
+
+        sr_analog_init(&analog, &encoding, &meaning, &spec, 2);
+        analog.meaning->channels = &ch_node;
+        analog.meaning->mq = SR_MQ_VOLTAGE;
+        analog.meaning->unit = SR_UNIT_VOLT;
+        analog.meaning->mqflags = 0;
+        analog.num_samples = per_channel;
+        analog.data = samples;
+
+        packet.type = SR_DF_ANALOG;
+        packet.payload = &analog;
+
+        ret = sr_session_send(sdi, &packet);
+        if (ret != SR_OK)
+            return ret;
     }
-
-    sr_analog_init(&analog, &encoding, &meaning, &spec, 2);
-    analog.meaning->channels = devc->enabled_analog_channels;
-    analog.meaning->mq = SR_MQ_VOLTAGE;
-    analog.meaning->unit = SR_UNIT_VOLT;
-    analog.meaning->mqflags = 0;
-    analog.num_samples = sample_count;
-    analog.data = samples;
-
-    packet.type = SR_DF_ANALOG;
-    packet.payload = &analog;
 
     devc->sent_scope_samples += sample_count;
 
-    return sr_session_send(sdi, &packet);
+    return SR_OK;
 }
 
 static void finish_acquisition(struct sr_dev_inst *sdi)
