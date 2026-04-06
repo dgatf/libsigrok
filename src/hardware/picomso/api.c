@@ -75,7 +75,7 @@ static const char *channel_names_logic[] = {
 };
 
 static const char *channel_names_analog[] = {
-    "A0", "A1", "A2",
+    "A0", "A1",
 };
 
 static gboolean is_plausible(const struct libusb_device_descriptor *des)

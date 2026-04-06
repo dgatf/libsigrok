@@ -422,6 +422,18 @@ static int trigger_match_to_picomso(enum sr_trigger_matches match,
     return SR_OK;
 }
 
+static gint compare_channel_index(gconstpointer a, gconstpointer b)
+{
+    const struct sr_channel *cha = a;
+    const struct sr_channel *chb = b;
+
+    if (cha->index < chb->index)
+        return -1;
+    if (cha->index > chb->index)
+        return 1;
+    return 0;
+}
+
 static int configure_capture_streams(const struct sr_dev_inst *sdi,
     uint8_t *streams)
 {
@@ -457,6 +469,9 @@ static int configure_capture_streams(const struct sr_dev_inst *sdi,
             enabled_logic++;
         }
     }
+
+    devc->enabled_analog_channels =
+        g_slist_sort(devc->enabled_analog_channels, compare_channel_index);
 
     if (enabled_logic > 0)
         *streams |= PICOMSO_STREAM_LOGIC;
@@ -615,15 +630,26 @@ static int send_scope_analog_data(struct sr_dev_inst *sdi,
 
     devc = sdi->priv;
 
+    /*
+     * Scope payload format:
+     *
+     * - The firmware always sends scope samples as little-endian 16-bit words.
+     * - Single-channel analog mode uses native 12-bit ADC samples in bits 11:0.
+     * - Dual-channel analog mode may internally capture 8-bit samples, but the
+     *   firmware expands them to a 12-bit-equivalent range before transmission.
+     *
+     * Therefore the host always consumes 16-bit little-endian samples and
+     * scales them as 12-bit values after masking with 0x0FFF.
+     */
     if ((block->data_len % 2u) != 0u)
         return SR_ERR;
 
     sample_count = block->data_len / 2u;
 
     /*
-     * N = number of enabled analog channels; incoming samples are
-     * interleaved: channel k receives raw samples at indices k, k+N,
-     * k+2N, ... Truncate to a whole number of N-sample frames.
+     * N = number of enabled analog channels; incoming samples are interleaved:
+     * channel k receives raw samples at indices k, k+N, k+2N, ...
+     * Truncate to a whole number of N-sample frames.
      */
     num_channels = (size_t)g_slist_length(devc->enabled_analog_channels);
     if (num_channels == 0u)
@@ -632,9 +658,8 @@ static int send_scope_analog_data(struct sr_dev_inst *sdi,
     sample_count -= sample_count % num_channels;
 
     /*
-     * limit_samples is a per-channel budget.  The total number of
-     * interleaved samples the driver should forward is therefore
-     * limit_samples * num_channels.
+     * limit_samples is a per-channel budget. The total number of interleaved
+     * samples the driver should forward is therefore limit_samples * num_channels.
      */
     if (devc->limit_samples &&
         devc->sent_scope_samples + sample_count >
@@ -657,12 +682,15 @@ static int send_scope_analog_data(struct sr_dev_inst *sdi,
             raw_idx = i * num_channels + ch_idx;
             raw = (uint16_t)block->data[2u * raw_idx]
                 | ((uint16_t)block->data[2u * raw_idx + 1u] << 8);
+
+            /* Scope samples are always transported as 12-bit-scaled values. */
             raw &= 0x0FFFu;
             samples[i] = (3.3f * (float)raw) / 4095.0f;
         }
 
         ch_node.data = l->data;
         ch_node.next = NULL;
+
         sr_analog_init(&analog, &encoding, &meaning, &spec, 2);
         analog.meaning->channels = &ch_node;
         analog.meaning->mq = SR_MQ_VOLTAGE;
