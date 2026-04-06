@@ -238,14 +238,16 @@ static int command_get_info(const struct sr_dev_inst *sdi,
 }
 
 static int command_get_capabilities(const struct sr_dev_inst *sdi,
-    uint32_t *capabilities)
+    struct picomso_capabilities *caps)
 {
     uint8_t response[PICOMSO_PROTOCOL_IO_BUFFER_SIZE];
     size_t response_len;
     const uint8_t *payload;
+    uint16_t payload_len;
+
     int ret;
 
-    if (!capabilities)
+    if (!caps)
         return SR_ERR_ARG;
 
     ret = send_request(sdi, PICOMSO_MSG_GET_CAPABILITIES, NULL, 0u,
@@ -253,11 +255,18 @@ static int command_get_capabilities(const struct sr_dev_inst *sdi,
     if (ret != SR_OK)
         return ret;
 
-    if (read_u16_le(response + 6) < 4u)
-        return SR_ERR;
+    payload_len = read_u16_le(response + 6);
+    if (payload_len < sizeof(*caps))
+        return SR_ERR_DATA;
 
     payload = response + PICOMSO_PACKET_HEADER_SIZE;
-    *capabilities = read_u32_le(payload);
+    memcpy(caps, payload, sizeof(*caps));
+
+    if (caps->version != 1u)
+        return SR_ERR_DATA;
+
+    if (caps->size != sizeof(*caps))
+        return SR_ERR_DATA;
 
     return SR_OK;
 }
@@ -928,21 +937,12 @@ SR_PRIV int picomso_dev_open(struct sr_dev_inst *sdi, struct sr_dev_driver *di)
             break;
         }
 
-        ret = command_get_capabilities(sdi, &devc->capabilities);
+        ret = command_get_capabilities(sdi, &devc->fw_caps);
         if (ret != SR_OK) {
             sr_err("Failed to query PicoMSO device capabilities.");
             libusb_release_interface(usb->devhdl, USB_INTERFACE);
             libusb_close(usb->devhdl);
             usb->devhdl = NULL;
-            break;
-        }
-
-        if ((devc->capabilities & (PICOMSO_CAP_LOGIC | PICOMSO_CAP_SCOPE)) == 0u) {
-            sr_err("Connected PicoMSO device exposes neither logic nor scope capability.");
-            libusb_release_interface(usb->devhdl, USB_INTERFACE);
-            libusb_close(usb->devhdl);
-            usb->devhdl = NULL;
-            ret = SR_ERR;
             break;
         }
 
@@ -1012,18 +1012,6 @@ SR_PRIV int picomso_start_acquisition(const struct sr_dev_inst *sdi)
         devc->cur_samplerate > SR_MHZ(2)) {
         sr_err("Analog stream requested with samplerate above 2 MHz.");
         return SR_ERR_ARG;
-    }
-
-    if ((streams & PICOMSO_STREAM_SCOPE) &&
-        (devc->capabilities & PICOMSO_CAP_SCOPE) == 0u) {
-        sr_err("This PicoMSO firmware does not expose oscilloscope capability.");
-        return SR_ERR_NA;
-    }
-
-    if ((streams & PICOMSO_STREAM_LOGIC) &&
-        (devc->capabilities & PICOMSO_CAP_LOGIC) == 0u) {
-        sr_err("This PicoMSO firmware does not expose logic capability.");
-        return SR_ERR_NA;
     }
 
     ret = build_capture_request(sdi, &request);

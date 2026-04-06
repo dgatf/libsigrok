@@ -179,6 +179,21 @@ struct picomso_data_block {
     uint8_t  data[PICOMSO_DATA_BLOCK_SIZE];
 };
 
+struct __attribute__((packed)) picomso_capabilities {
+    uint8_t version;
+    uint8_t size;
+
+    uint8_t capabilities_flags;
+    uint8_t max_logic_channels;
+    uint8_t max_analog_channels;
+
+    uint32_t max_samplerate_logic;
+    uint32_t max_samplerate_scope;
+
+    uint32_t max_samples_logic;
+    uint32_t max_samples_scope;
+};
+
 struct dev_context {
     const struct picomso_profile *profile;
     char **channel_names;
@@ -192,8 +207,8 @@ struct dev_context {
     uint64_t sent_logic_samples;
     uint64_t sent_scope_samples;
 
-    uint32_t capabilities;
     struct picomso_info info;
+    struct picomso_capabilities fw_caps;
 
     uint8_t next_seq;
     uint8_t last_device_status;

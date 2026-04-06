@@ -21,8 +21,10 @@
 #include "protocol.h"
 
 static const struct picomso_profile supported_picomso[] = {
-    { 0x04b5, 0x2041, "Raspberry Pi", "PicoMSO", NULL,
-        "Raspberry Pi", "PicoMSO" },
+    { 0x2E8A, 0x2040, "PicoMSO", "PicoMSO-RP2040", NULL,
+      "PicoMSO", "PicoMSO-RP2040" },
+    { 0x2E8A, 0x2350, "PicoMSO", "PicoMSO-RP2350", NULL,
+      "PicoMSO", "PicoMSO-RP2350" },
     ALL_ZERO
 };
 
@@ -375,9 +377,11 @@ static int config_set(uint32_t key, GVariant *data,
         break;
     case SR_CONF_LIMIT_SAMPLES:
         value = g_variant_get_uint64(data);
-        if (value == 0 || value > PICOMSO_MAX_POST_TRIGGER_SAMPLES)
-            return SR_ERR_ARG;
-        devc->limit_samples = value;
+        uint32_t max_samples = devc->fw_caps.max_samples_logic;
+
+    if (value == 0 || value > max_samples)
+        return SR_ERR_ARG;
+    devc->limit_samples = value;
         break;
     case SR_CONF_CAPTURE_RATIO:
         value = g_variant_get_uint64(data);
@@ -409,7 +413,7 @@ static int config_list(uint32_t key, GVariant **data,
     case SR_CONF_LIMIT_SAMPLES:
     *data = g_variant_new("(tt)",
         (guint64)1,
-        (guint64)PICOMSO_MAX_POST_TRIGGER_SAMPLES);
+        (guint64)devc->fw_caps.max_samples_logic);
     break;
     case SR_CONF_SAMPLERATE:
         if (!devc)
