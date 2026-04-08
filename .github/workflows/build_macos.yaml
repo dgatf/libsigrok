@@ -1,0 +1,64 @@
+name: Build libsigrok macOS binaries
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    name: Build on macOS
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            glib \
+            libusb \
+            libzip \
+            libserialport \
+            libftdi
+
+      - name: Bootstrap
+        run: |
+          ./autogen.sh
+
+      - name: Configure
+        run: |
+          ./configure \
+            --prefix=/usr/local \
+            --disable-static
+
+      - name: Build
+        run: |
+          make -j"$(sysctl -n hw.ncpu)"
+
+      - name: Install into staging dir
+        run: |
+          make DESTDIR="$PWD/stage" install
+
+      - name: Package
+        run: |
+          PKGDIR="libsigrok-macos"
+          mkdir -p "$PKGDIR"
+          cp -a stage/usr/local "$PKGDIR"/
+          [ -f COPYING ] && cp COPYING "$PKGDIR"/
+          [ -f README ] && cp README "$PKGDIR"/
+          tar -czf "${PKGDIR}.tar.gz" "$PKGDIR"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libsigrok-macos
+          path: libsigrok-macos.tar.gz

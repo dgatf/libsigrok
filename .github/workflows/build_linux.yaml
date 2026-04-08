@@ -1,0 +1,80 @@
+name: Build libsigrok binaries
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Build on ${{ matrix.distro }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: ubuntu-22.04
+            container: ubuntu:22.04
+          - distro: ubuntu-24.04
+            container: ubuntu:24.04
+
+    container:
+      image: ${{ matrix.container }}
+
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential \
+            git \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            libglib2.0-dev \
+            libzip-dev \
+            libusb-1.0-0-dev \
+            libftdi1-dev \
+            libserialport-dev \
+            check \
+            wget \
+            ca-certificates \
+            tar \
+            xz-utils
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bootstrap
+        run: |
+          ./autogen.sh
+
+      - name: Configure
+        run: |
+          ./configure \
+            --prefix=/usr \
+            --disable-static
+
+      - name: Build
+        run: |
+          make -j"$(nproc)"
+
+      - name: Install into staging dir
+        run: |
+          make DESTDIR="$PWD/stage" install
+
+      - name: Package
+        run: |
+          PKGDIR="libsigrok-${{ matrix.distro }}"
+          mkdir -p "$PKGDIR"
+          cp -a stage/usr "$PKGDIR"/
+          tar -czf "${PKGDIR}.tar.gz" "$PKGDIR"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libsigrok-${{ matrix.distro }}
+          path: libsigrok-${{ matrix.distro }}.tar.gz
