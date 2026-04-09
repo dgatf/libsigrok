@@ -44,6 +44,8 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: picomso-driver
 
       - name: Bootstrap
         run: ./autogen.sh
