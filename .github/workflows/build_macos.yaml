@@ -1,4 +1,4 @@
-name: Build libsigrok macOS binaries
+name: Build libsigrok macOS
 
 on:
   push:
@@ -7,12 +7,16 @@ on:
 
 jobs:
   build-macos:
-    name: Build on macOS
-    runs-on: macos-14
+    name: Build on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ macos-14, macos-15 ]
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
@@ -29,8 +33,7 @@ jobs:
             libftdi
 
       - name: Bootstrap
-        run: |
-          ./autogen.sh
+        run: ./autogen.sh
 
       - name: Configure
         run: |
@@ -39,16 +42,19 @@ jobs:
             --disable-static
 
       - name: Build
-        run: |
-          make -j"$(sysctl -n hw.ncpu)"
+        run: make -j"$(sysctl -n hw.ncpu)"
 
       - name: Install into staging dir
+        run: make DESTDIR="$PWD/stage" install
+
+      - name: Verify package contents
         run: |
-          make DESTDIR="$PWD/stage" install
+          find stage/usr/local -maxdepth 3 | sort
+          ls -l stage/usr/local/lib/libsigrok*.dylib || true
 
       - name: Package
         run: |
-          PKGDIR="libsigrok-macos"
+          PKGDIR="libsigrok-${{ matrix.runner }}"
           mkdir -p "$PKGDIR"
           cp -a stage/usr/local "$PKGDIR"/
           [ -f COPYING ] && cp COPYING "$PKGDIR"/
@@ -58,5 +64,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libsigrok-macos
-          path: libsigrok-macos.tar.gz
+          name: libsigrok-${{ matrix.runner }}
+          path: libsigrok-${{ matrix.runner }}.tar.gz

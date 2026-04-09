@@ -1,4 +1,4 @@
-name: Build libsigrok Windows binaries
+name: Build libsigrok Windows
 
 on:
   push:
@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
@@ -34,15 +34,12 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-glib2
             mingw-w64-ucrt-x86_64-libusb
-            mingw-w64-ucrt-x86_64-libusb-compat
             mingw-w64-ucrt-x86_64-libzip
             mingw-w64-ucrt-x86_64-libserialport
-            mingw-w64-ucrt-x86_64-libusb-win32
             mingw-w64-ucrt-x86_64-libftdi
 
       - name: Bootstrap
-        run: |
-          ./autogen.sh
+        run: ./autogen.sh
 
       - name: Configure
         run: |
@@ -51,30 +48,24 @@ jobs:
             --disable-static
 
       - name: Build
-        run: |
-          make -j"$(nproc)"
+        run: make -j"$(nproc)"
 
-      - name: Install to staging
-        run: |
-          make DESTDIR="$PWD/stage" install
+      - name: Install into staging dir
+        run: make DESTDIR="$PWD/stage" install
 
-      - name: Collect runtime package
+      - name: Verify package contents
+        run: |
+          find stage/ucrt64 -maxdepth 3 | sort
+          ls -l stage/ucrt64/bin/*sigrok* || true
+          ls -l stage/ucrt64/lib/*sigrok* || true
+
+      - name: Package
         run: |
           PKGDIR="libsigrok-windows-ucrt64"
-          mkdir -p "$PKGDIR"/bin
-          mkdir -p "$PKGDIR"/lib
-          mkdir -p "$PKGDIR"/include
-          mkdir -p "$PKGDIR"/lib/pkgconfig
-
-          cp -a stage/ucrt64/bin/*.dll "$PKGDIR"/bin/ || true
-          cp -a stage/ucrt64/lib/libsigrok.dll.a "$PKGDIR"/lib/ || true
-          cp -a stage/ucrt64/include/* "$PKGDIR"/include/
-          cp -a stage/ucrt64/lib/pkgconfig/sigrok.pc "$PKGDIR"/lib/pkgconfig/ || true
-
-          # Optional: copy license/readme if present
+          mkdir -p "$PKGDIR"
+          cp -a stage/ucrt64 "$PKGDIR"/
           [ -f COPYING ] && cp COPYING "$PKGDIR"/
           [ -f README ] && cp README "$PKGDIR"/
-
           zip -r "${PKGDIR}.zip" "$PKGDIR"
 
       - name: Upload artifact

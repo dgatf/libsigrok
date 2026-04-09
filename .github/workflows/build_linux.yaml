@@ -1,4 +1,4 @@
-name: Build libsigrok binaries
+name: Build libsigrok Linux
 
 on:
   push:
@@ -38,7 +38,6 @@ jobs:
             libftdi1-dev \
             libserialport-dev \
             check \
-            wget \
             ca-certificates \
             tar \
             xz-utils
@@ -47,28 +46,32 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Bootstrap
-        run: |
-          ./autogen.sh
+        run: ./autogen.sh
 
       - name: Configure
         run: |
           ./configure \
-            --prefix=/usr \
+            --prefix=/usr/local \
             --disable-static
 
       - name: Build
-        run: |
-          make -j"$(nproc)"
+        run: make -j"$(nproc)"
 
       - name: Install into staging dir
+        run: make DESTDIR="$PWD/stage" install
+
+      - name: Verify package contents
         run: |
-          make DESTDIR="$PWD/stage" install
+          find stage/usr/local -maxdepth 3 | sort
+          ls -l stage/usr/local/lib/libsigrok.so* || true
 
       - name: Package
         run: |
           PKGDIR="libsigrok-${{ matrix.distro }}"
           mkdir -p "$PKGDIR"
-          cp -a stage/usr "$PKGDIR"/
+          cp -a stage/usr/local "$PKGDIR"/
+          [ -f COPYING ] && cp COPYING "$PKGDIR"/
+          [ -f README ] && cp README "$PKGDIR"/
           tar -czf "${PKGDIR}.tar.gz" "$PKGDIR"
 
       - name: Upload artifact
