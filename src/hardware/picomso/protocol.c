@@ -35,14 +35,6 @@ static uint16_t read_u16_le(const uint8_t *data)
     return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
 }
 
-static uint32_t read_u32_le(const uint8_t *data)
-{
-    return (uint32_t)data[0]
-        | ((uint32_t)data[1] << 8)
-        | ((uint32_t)data[2] << 16)
-        | ((uint32_t)data[3] << 24);
-}
-
 static void write_u16_le(uint8_t *data, uint16_t value)
 {
     data[0] = (uint8_t)(value & 0xffu);
@@ -504,8 +496,6 @@ static int build_capture_request(const struct sr_dev_inst *sdi,
     struct sr_trigger_match *match;
     struct sr_channel *ch;
     const GSList *l;
-    uint64_t post_trigger_samples;
-    uint64_t pre_trigger_samples;
     uint64_t total_samples;
     unsigned int trigger_index;
     int ret;
@@ -513,28 +503,19 @@ static int build_capture_request(const struct sr_dev_inst *sdi,
     devc = sdi->priv;
     memset(request, 0, sizeof(*request));
 
-    post_trigger_samples = devc->limit_samples ?
+    total_samples = devc->limit_samples ?
         devc->limit_samples : PICOMSO_DEFAULT_LIMIT_SAMPLES;
 
-    if (post_trigger_samples == 0
-        || post_trigger_samples > PICOMSO_MAX_POST_TRIGGER_SAMPLES)
-        return SR_ERR_ARG;
     if (devc->cur_samplerate == 0)
         return SR_ERR_ARG;
     if (devc->capture_ratio > 100)
         return SR_ERR_ARG;
-
-    pre_trigger_samples = (devc->capture_ratio * post_trigger_samples) / 100;
-    if (pre_trigger_samples > PICOMSO_MAX_PRE_TRIGGER_SAMPLES)
-        return SR_ERR_ARG;
-
-    total_samples = pre_trigger_samples + post_trigger_samples;
     if (total_samples > PICOMSO_MAX_TOTAL_SAMPLES)
         return SR_ERR_ARG;
 
     request->total_samples = (uint32_t)total_samples;
     request->rate = (uint32_t)devc->cur_samplerate;
-    request->pre_trigger_samples = (uint32_t)pre_trigger_samples;
+    request->pre_trigger_samples = request->total_samples * devc->capture_ratio / 100u;
 
     /*
      * Build the analog channel mask from the enabled analog channel list.
@@ -1008,8 +989,10 @@ SR_PRIV int picomso_start_acquisition(const struct sr_dev_inst *sdi)
     if (ret != SR_OK)
         return ret;
 
-    if ((streams & PICOMSO_STREAM_SCOPE) &&
-        devc->cur_samplerate > SR_MHZ(2)) {
+    guint analog_channels = g_slist_length(devc->enabled_analog_channels);
+    if ((streams & PICOMSO_STREAM_SCOPE) 
+        && ((devc->cur_samplerate > SR_MHZ(2) && analog_channels == 1)
+        || (devc->cur_samplerate > SR_MHZ(1) && analog_channels == 2))) {
         sr_err("Analog stream requested with samplerate above 2 MHz.");
         return SR_ERR_ARG;
     }
